@@ -1,0 +1,33 @@
+# -----------------------------------------------------------------------------
+# Instant Messages Microservice — non-secret runtime configuration.
+#
+# Copy this file to config/app.yaml (or mount as a Docker volume) and edit.
+# Changes pick up after a server restart, or via:
+#
+#   POST /api/v1/admin/reload-config   (with X-Admin-Key header)
+# -----------------------------------------------------------------------------
+
+teams:
+  # Named webhook registry — clients send webhook_target: "superstat" to route.
+  named_webhooks:
+    # superstat: "https://..."
+    # marketing: "https://..."
+
+  # Default styling applied when the caller omits values (currently advisory;
+  # reserved for future expansion).
+  defaults:
+    banner_style: "attention"
+    title_weight: "bolder"
+    title_size: "medium"
+
+http:
+  # Timeout (seconds) applied to every outbound webhook POST.
+  timeout_seconds: 15
+  # Retries on timeout / network error / 5xx. 4xx is never retried.
+  max_retries: 2
+
+api:
+  cors:
+    # Origins allowed to call the API from a browser.
+    allow_origins:
+      - "*"
