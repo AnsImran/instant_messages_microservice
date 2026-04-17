@@ -1,0 +1,200 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write                   # required to push images to GHCR
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Always-run tests — cheap and prevents broken code from reaching main.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies (frozen)
+        run: uv sync --frozen
+
+      - name: Compile Python
+        run: uv run python -m compileall -q main.py src
+
+      - name: Run pytest
+        run: uv run pytest -q
+
+  # ---------------------------------------------------------------------------
+  # Paths-filter — decides whether the build+deploy jobs should run at all.
+  # README-only or docs-only pushes are detected here and skipped.
+  # ---------------------------------------------------------------------------
+  detect-changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'main.py'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'Dockerfile'
+              - 'docker-compose.yml'
+              - 'config/app.yaml.example'
+              - '.github/workflows/**'
+
+  # ---------------------------------------------------------------------------
+  # Build and push Docker image to GHCR.
+  # Only runs on pushes to main AND when real code (not docs) changed.
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build and push image
+    needs: [test, detect-changes]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.detect-changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        env:
+          SOURCE_DATE_EPOCH: 0
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ghcr.io/ansimran/instant_messages_microservice:latest
+            ghcr.io/ansimran/instant_messages_microservice:${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=registry,ref=ghcr.io/ansimran/instant_messages_microservice:buildcache
+          cache-to:   type=registry,ref=ghcr.io/ansimran/instant_messages_microservice:buildcache,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Deploy: SSH to the EC2 host, git-pull the repo, docker compose pull + up.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: true
+    steps:
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ secrets.DEPLOY_HOST }}"       || (echo "Missing secret: DEPLOY_HOST"       && exit 1)
+          test -n "${{ secrets.DEPLOY_USER }}"       || (echo "Missing secret: DEPLOY_USER"       && exit 1)
+          test -n "${{ secrets.DEPLOY_GIT_PATH }}"   || (echo "Missing secret: DEPLOY_GIT_PATH"   && exit 1)
+          test -n "${{ secrets.DEPLOY_SSH_KEY }}"    || (echo "Missing secret: DEPLOY_SSH_KEY"    && exit 1)
+          test -n "${{ secrets.GHCR_USER }}"         || (echo "Missing secret: GHCR_USER"         && exit 1)
+          test -n "${{ secrets.GHCR_TOKEN }}"        || (echo "Missing secret: GHCR_TOKEN"        && exit 1)
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          cat > ~/.ssh/id_deploy <<'EOF'
+          ${{ secrets.DEPLOY_SSH_KEY }}
+          EOF
+          chmod 600 ~/.ssh/id_deploy
+
+          PORT="${{ secrets.DEPLOY_PORT }}"
+          if [ -z "$PORT" ]; then PORT="22"; fi
+          ssh-keyscan -p "$PORT" -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Pull + deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.DEPLOY_PORT }}"
+          if [ -z "$PORT" ]; then PORT="22"; fi
+
+          # Base64-encode secrets so they travel cleanly through the SSH shell boundary.
+          DEPLOY_GIT_PATH_B64="$(printf '%s' "${{ secrets.DEPLOY_GIT_PATH }}" | base64 -w0)"
+          GHCR_USER_B64="$(printf '%s' "${{ secrets.GHCR_USER }}" | base64 -w0)"
+          GHCR_TOKEN_B64="$(printf '%s' "${{ secrets.GHCR_TOKEN }}" | base64 -w0)"
+
+          ssh -p "$PORT" -i ~/.ssh/id_deploy "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "DEPLOY_GIT_PATH_B64='$DEPLOY_GIT_PATH_B64' GHCR_USER_B64='$GHCR_USER_B64' GHCR_TOKEN_B64='$GHCR_TOKEN_B64' bash -s" <<'EOS'
+          set -euo pipefail
+          export GIT_TERMINAL_PROMPT=0
+
+          deploy_git_path="$(printf '%s' "$DEPLOY_GIT_PATH_B64" | base64 -d)"
+          ghcr_user="$(printf '%s' "$GHCR_USER_B64" | base64 -d)"
+          ghcr_token="$(printf '%s' "$GHCR_TOKEN_B64" | base64 -d)"
+
+          cd "$deploy_git_path"
+
+          git fetch --prune origin main
+          git checkout main
+          git reset --hard origin/main
+
+          echo "$ghcr_token" | docker login ghcr.io -u "$ghcr_user" --password-stdin
+
+          docker compose pull
+          docker compose up -d --remove-orphans
+          docker image prune -f
+
+          echo "Waiting for the service to become healthy..."
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8014/api/v1/health >/dev/null 2>&1; then
+              echo "Service healthy after ${i} attempt(s)."
+              break
+            fi
+            sleep 2
+          done
+
+          docker compose ps
+          echo ""
+          echo "=== /api/v1/version ==="
+          curl -fsS http://127.0.0.1:8014/api/v1/version || true
+          echo ""
+          EOS

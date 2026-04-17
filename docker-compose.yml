@@ -1,0 +1,23 @@
+services:
+  instant-messages:
+    image: ghcr.io/ansimran/instant_messages_microservice:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: instant-messages
+    env_file: .env
+    ports:
+      # Bind to localhost only — nginx (or whatever is on 80/443) fronts this service.
+      # 8014 was verified free on this host at deploy time.
+      - "127.0.0.1:8014:8000"
+    volumes:
+      # Mount the YAML config from the host so it can be edited and reloaded
+      # via POST /api/v1/admin/reload-config without rebuilding the image.
+      - ./config/app.yaml:/app/config/app.yaml:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

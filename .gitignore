@@ -11,6 +11,16 @@ wheels/
 
 # Secrets
 .env
+.env.*
+!.env.example
+
+# Private keys, PATs, anything in credentials/
+credentials/
+*.pem
+*.key
+id_rsa
+id_rsa.*
+*.pat
 
 # Runtime config (contains webhook URLs in production). The *.example version is committed.
 config/app.yaml
@@ -18,3 +28,15 @@ config/app.yaml
 # Tooling
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
