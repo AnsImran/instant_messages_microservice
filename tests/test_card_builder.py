@@ -134,3 +134,46 @@ def test_row_must_have_a_side() -> None:
     from pydantic import ValidationError
     with pytest.raises(ValidationError):
         MessageRow()
+
+
+def test_banner_only_card_renders() -> None:
+    """A card with only a banner (no title, no rows, no buttons) should render."""
+    msg  = TeamsMessage(banner=Banner(text="Alert only", style=BannerStyle.WARNING))
+    card = _card(render_card(msg))
+    # One Container element; no title/row/button elements.
+    assert len(card["body"])                == 1
+    assert card["body"][0]["type"]          == "Container"
+    assert card["body"][0]["style"]         == "warning"
+    assert card["body"][0]["items"][0]["text"] == "Alert only"
+    assert "actions" not in card, "no buttons -> no actions array"
+
+
+def test_buttons_only_card_renders() -> None:
+    """A card with only buttons (no body text anywhere) is valid and renders."""
+    msg  = TeamsMessage(buttons=[Button(title="Go", url="https://example.com")])
+    card = _card(render_card(msg))
+    # Body is empty; the actions list carries the button.
+    assert card["body"]        == []
+    assert card["actions"][0]["type"]  == "Action.OpenUrl"
+    assert card["actions"][0]["title"] == "Go"
+    assert card["actions"][0]["url"]   == "https://example.com/"
+
+
+def test_multiple_two_column_rows_keep_consistent_widths() -> None:
+    """
+    Every two-column row must use the same (stretch, auto) widths — that
+    consistency is what makes the right-hand column line up vertically across
+    rows in Teams.
+    """
+    msg = TeamsMessage(rows=[
+        MessageRow(left=TextSpan(text="A"),   right=TextSpan(text="1")),
+        MessageRow(left=TextSpan(text="BB"),  right=TextSpan(text="22")),
+        MessageRow(left=TextSpan(text="CCC"), right=TextSpan(text="333")),
+    ])
+    body = _card(render_card(msg))["body"]
+    assert len(body) == 3
+    for row in body:
+        assert row["type"]                             == "ColumnSet"
+        assert [c["width"] for c in row["columns"]]    == ["stretch", "auto"]
+        assert row["columns"][0]["items"][0]["horizontalAlignment"] == "Left"
+        assert row["columns"][1]["items"][0]["horizontalAlignment"] == "Right"
