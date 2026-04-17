@@ -1,15 +1,10 @@
 {
-  "banner": {"text": "SMOKE TEST — new microservice is live", "style": "good", "bold": true},
+  "banner": {"text": "Deployment successful", "style": "good", "bold": true},
   "title":  {"text": "Instant Messages Microservice", "weight": "bolder", "size": "large", "color": "accent"},
   "rows": [
-    {"left": {"text": "Service", "weight": "bolder"}, "right": {"text": "microservice-instant-messages"}},
+    {"left": {"text": "Service", "weight": "bolder"}, "right": {"text": "Instant Messages Microservice"}},
     {"left": {"text": "Version", "weight": "bolder"}, "right": {"text": "0.1.0"}},
-    {"left": {"text": "Status",  "weight": "bolder"}, "right": {"text": "all green", "color": "good", "weight": "bolder"}, "separator": true},
-    {"left": {"text": "Tests",   "weight": "bolder"}, "right": {"text": "31 / 31 passing", "color": "good"}},
-    {"left": {"text": "Docs — see [Swagger UI](http://localhost:8000/docs) for the full schema."}, "separator": true}
-  ],
-  "buttons": [
-    {"title": "Open Swagger", "url": "http://localhost:8000/docs"},
-    {"title": "Anthropic",    "url": "https://www.anthropic.com"}
+    {"left": {"text": "Status",  "weight": "bolder"}, "right": {"text": "healthy",         "color": "good", "weight": "bolder"}, "separator": true},
+    {"left": {"text": "Tests",   "weight": "bolder"}, "right": {"text": "31 / 31 passing", "color": "good"}}
   ]
 }
