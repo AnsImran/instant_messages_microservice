@@ -76,10 +76,13 @@ jobs:
   build-and-push:
     name: Build and push image
     needs: [test, detect-changes]
+    # Build+deploy when code actually changed on a push to main,
+    # or always when triggered manually via workflow_dispatch.
     if: >-
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/main' &&
-      needs.detect-changes.outputs.code == 'true'
+      github.ref == 'refs/heads/main' && (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && needs.detect-changes.outputs.code == 'true')
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
