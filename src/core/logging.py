@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
+import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from src.core.config import Settings
@@ -76,9 +79,11 @@ def configure_logging(settings: Settings) -> None:
     """
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
 
+    formatter: logging.Formatter = JsonFormatter() if settings.log_format.lower() == "json" else PrettyFormatter()
+
     # Build the single stdout handler we use.
     handler = logging.StreamHandler(stream=sys.stdout)
-    handler.setFormatter(JsonFormatter() if settings.log_format.lower() == "json" else PrettyFormatter())
+    handler.setFormatter(formatter)
 
     # Reset the root logger so re-configuration is idempotent.
     root = logging.getLogger()
@@ -86,6 +91,17 @@ def configure_logging(settings: Settings) -> None:
         root.removeHandler(existing)
     root.addHandler(handler)
     root.setLevel(level)
+
+    # Phase-2 observability: when WLS_LOG_FILE is set, also write to a
+    # rotating file so Promtail can tail it and ship to Loki.
+    file_path = os.environ.get("WLS_LOG_FILE")
+    if file_path:
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            file_path, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
     # Calm down the noisy third-party loggers we don't control.
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)

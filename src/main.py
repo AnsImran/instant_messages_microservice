@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from src.api.v1.router import v1_router
 from src.core.config import Settings, get_settings
@@ -91,6 +92,17 @@ def create_app() -> FastAPI:
 
     # ---- routes ----
     app.include_router(v1_router)
+
+    # ---- Prometheus metrics (§38) ----
+    Instrumentator(
+        excluded_handlers=[
+            "/metrics",
+            ".*/health.*",
+            ".*/healthz",
+            ".*/readyz",
+            ".*/ping",
+        ],
+    ).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
     return app
 
