@@ -2,13 +2,11 @@
 #
 # Production image for the Instant Messages FastAPI microservice.
 # Uses `uv` to install from the committed lockfile so builds are reproducible.
+# CMD wraps `uvicorn` with `opentelemetry-instrument`; traces ship when
+# OTEL_* env vars are set by docker-compose.
 
 FROM python:3.12-slim AS base
 
-# ---------------------------------------------------------------------------
-# Base runtime: small, unbuffered Python. `uv` is installed from its official
-# image so we never have to pip-install it (faster, deterministic).
-# ---------------------------------------------------------------------------
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
@@ -20,15 +18,14 @@ COPY --from=ghcr.io/astral-sh/uv:0.8 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# ---------------------------------------------------------------------------
-# Dependency layer — cached as long as pyproject.toml + uv.lock don't change.
-# ---------------------------------------------------------------------------
+# Dependency layer — cached unless pyproject.toml / uv.lock change.
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project --no-dev
 
-# ---------------------------------------------------------------------------
-# Source layer — only this rebuilds when src/ or main.py changes.
-# ---------------------------------------------------------------------------
+# OTel auto-instrumentors (fastapi, httpx, logging, asgi, stdlib).
+RUN opentelemetry-bootstrap -a install
+
+# Source.
 COPY main.py ./
 COPY src/    ./src/
 COPY config/ ./config/
@@ -36,10 +33,7 @@ COPY config/ ./config/
 # Final install so the project itself is registered in the venv.
 RUN uv sync --frozen --no-dev
 
-# ---------------------------------------------------------------------------
-# Runtime.
-# ---------------------------------------------------------------------------
 EXPOSE 8000
 
-# Uvicorn is bundled inside our dependency set via `uvicorn[standard]`.
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# opentelemetry-instrument wraps uvicorn. Inert when OTEL env vars absent.
+CMD ["opentelemetry-instrument", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
