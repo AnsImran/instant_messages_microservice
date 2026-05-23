@@ -162,6 +162,48 @@ def render_card(message: TeamsMessage) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Plain-text splitting — keep each delivered message within the size budget.
+# ---------------------------------------------------------------------------
+# Per plain-message size budget (bytes). Empirically the Power Automate "Post
+# message" path silently drops messages above ~100 KB; 64 KB is the safe target.
+# A /text request larger than this is split into multiple <=64 KB messages.
+TEAMS_TEXT_CHUNK_BYTES = 64 * 1024
+
+
+def split_text_for_teams(text: str, max_bytes: int = TEAMS_TEXT_CHUNK_BYTES) -> list[str]:
+    """Split ``text`` into chunks whose UTF-8 size is each <= ``max_bytes``,
+    without breaking a multibyte character. Prefers to cut at the last newline
+    within the byte budget so chunks stay readable; falls back to a hard
+    character boundary when a single line exceeds the budget. Returns
+    ``[text]`` unchanged when it already fits."""
+    if len(text.encode("utf-8")) <= max_bytes:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining.encode("utf-8")) <= max_bytes:
+            chunks.append(remaining)
+            break
+        # Largest character prefix whose UTF-8 length fits the budget (binary search).
+        lo, hi = 1, len(remaining)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(remaining[:mid].encode("utf-8")) <= max_bytes:
+                lo = mid
+            else:
+                hi = mid - 1
+        cut = lo
+        # Prefer a clean newline break within the budget (keep the newline in this chunk).
+        nl = remaining.rfind("\n", 0, cut)
+        if nl > 0:
+            cut = nl + 1
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+    return chunks
+
+
+# ---------------------------------------------------------------------------
 # TeamsService — owns the HTTP call, retry logic, and exception mapping.
 # ---------------------------------------------------------------------------
 class TeamsService:

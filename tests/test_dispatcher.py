@@ -115,6 +115,47 @@ async def test_enqueue_raises_queue_full_at_capacity(monkeypatch) -> None:
         await http.aclose()
 
 
+async def test_text_payload_is_timestamped_before_post(monkeypatch) -> None:
+    """The dispatcher prepends a California send-time stamp to text payloads,
+    right before the POST (so it reflects the actual post-pacing send moment)."""
+    disp, http = await _make_dispatcher(min_interval=0.0)
+    seen: list[dict] = []
+
+    async def fake_post(*, url, payload, request_id):
+        seen.append(payload)
+
+    monkeypatch.setattr(disp._teams, "post_rendered", fake_post)
+    try:
+        disp.enqueue(url="https://hook.example/T", payload={"text": "body"}, request_id="t")
+        await _wait_for(lambda: len(seen) == 1)
+        sent = seen[0]["text"]
+        assert sent.endswith("body")
+        assert sent.startswith("[sent ")          # a stamp was prepended
+        assert sent != "body"
+    finally:
+        await disp.aclose()
+        await http.aclose()
+
+
+async def test_non_text_payload_passes_through_unstamped(monkeypatch) -> None:
+    """Card (non-text) payloads are delivered unchanged — only plain text is stamped."""
+    disp, http = await _make_dispatcher(min_interval=0.0)
+    seen: list[dict] = []
+
+    async def fake_post(*, url, payload, request_id):
+        seen.append(payload)
+
+    monkeypatch.setattr(disp._teams, "post_rendered", fake_post)
+    try:
+        card = {"type": "message", "attachments": [{"x": 1}]}
+        disp.enqueue(url="https://hook.example/C", payload=card, request_id="c")
+        await _wait_for(lambda: len(seen) == 1)
+        assert seen[0] == card
+    finally:
+        await disp.aclose()
+        await http.aclose()
+
+
 async def test_aclose_rejects_further_enqueue() -> None:
     """After shutdown the dispatcher refuses new work."""
     disp, http = await _make_dispatcher(min_interval=0.1)

@@ -1,5 +1,5 @@
 """
-Per-webhook outbound queue (0.5s pacing).
+Per-webhook outbound queue (paced; default 10s per webhook).
 
 Why this exists
 ---------------
@@ -16,9 +16,9 @@ background worker `asyncio.Task`. Callers `enqueue()` (non-blocking) and the
 endpoint returns 202 immediately; the worker drains its queue on a **slot
 clock** — fire at t0, t0+interval, t0+2·interval, … — so spacing is exact even
 when an individual POST takes longer than the interval. Each POST is *spawned*
-(not awaited) by the worker so a slow delivery never delays the next slot;
-deliveries therefore overlap (at 0.5s spacing with ~1s POSTs that is ≤~2
-concurrent per webhook — far below the burst that caused drops).
+(not awaited) by the worker so a slow delivery never delays the next slot (at the
+default 10s spacing with ~1-2s POSTs they don't normally overlap; the spawn is
+what guarantees one slow POST can't push the next slot late).
 
 Different webhooks are fully independent: each has its own queue, worker, and
 slot clock, so they run in parallel.
@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -48,6 +50,22 @@ _logger = logging.getLogger("dispatcher")
 
 # Queue item: (rendered payload, request_id).
 _Item = tuple[dict[str, Any], Optional[str]]
+
+# Every outbound message is stamped with its ACTUAL send time (the moment we POST,
+# after pacing) in California time. Teams exposes no per-message delivery
+# timestamp, so this embedded stamp is the only record of when we sent it.
+_LOS_ANGELES = ZoneInfo("America/Los_Angeles")
+
+
+def _with_send_timestamp(payload: dict[str, Any]) -> dict[str, Any]:
+    """Prepend the actual send time (America/Los_Angeles, DST-aware) to a
+    plain-text payload, right before the POST. Non-text payloads (Adaptive Cards)
+    are returned unchanged."""
+    if "text" not in payload:
+        return payload
+    now = datetime.now(_LOS_ANGELES)
+    stamp = f"[sent {now:%Y-%m-%d %H:%M:%S %Z}]\n"
+    return {**payload, "text": stamp + str(payload["text"])}
 
 
 class WebhookDispatcher:
@@ -157,7 +175,8 @@ class WebhookDispatcher:
         Fire-and-forget: success and failure are logged; nothing is raised. The
         log line's timestamp is the authoritative 'posted to the webhook' time."""
         try:
-            await self._teams.post_rendered(url=url, payload=payload, request_id=request_id)
+            stamped = _with_send_timestamp(payload)
+            await self._teams.post_rendered(url=url, payload=stamped, request_id=request_id)
             _logger.info(
                 "webhook_delivered",
                 extra={"path": f"webhook:{host}", "method": "POST", "request_id": request_id},

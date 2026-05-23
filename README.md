@@ -3,7 +3,7 @@
 A small web service that delivers messages to a Microsoft Teams chat. Two ways to send:
 
 - **Adaptive Card** (`POST /api/v1/teams/messages`) — describe "banner with red alert, title in bold, a row of ticket info, two buttons" and it builds the Adaptive Card JSON for you.
-- **Plain text** (`POST /api/v1/teams/text`) — send `{"text": "..."}` and it posts it as a plain message (for a Power Automate "Post message" flow that maps `body.text`). Teams renders light Markdown; newlines preserved.
+- **Plain text** (`POST /api/v1/teams/text`) — send `{"text": "..."}` and it posts it as a plain message (for a Power Automate "Post message" flow that maps `body.text`). Teams renders light Markdown; newlines preserved. Keep messages **≤ 64 KB**; larger requests are split into ≤ 64 KB parts — see [size policy](#post-apiv1teamstext).
 
 **Delivery is queued and fire-and-forget.** A request is validated, the webhook is resolved, the payload is built, and then **handed to a per-webhook queue and acknowledged with `202 queued` immediately**. A background worker drains each webhook's queue on a fixed cadence (`per_webhook_min_interval_seconds`, default 0.5s) so a burst to one webhook isn't throttled/dropped downstream by Power Automate / Teams. Each webhook is paced independently.
 
@@ -349,15 +349,44 @@ Plain text (no card). Posts `{"text": <text>}` to the webhook — for a Power Au
 }
 ```
 
-Same webhook-selection priority as `/messages`. Teams renders light Markdown (bold, italics, links); `\n` newlines are preserved. Max ~28 KB (the Teams message size limit).
+Same webhook-selection priority as `/messages`. Teams renders light Markdown (bold, italics, links); `\n` newlines are preserved.
+
+**Size policy.** Each delivered message is capped at **64 KB**. A `/text` request at or under 64 KB is sent as a single message; anything **larger than 64 KB is split** into multiple ≤ 64 KB messages (preferring newline boundaries, never breaking a multibyte character — `split_text_for_teams` in `src/services/teams.py`), and each part is enqueued and paced like any other send. The request body itself is accepted up to a **256 KB** safety ceiling (`422` above that).
+
+Why 64 KB: empirically the plain-message hard ceiling on the Power Automate "Post message" path is **~100 KB** — a ~98 KiB body lands intact, while ~100 KiB and up are **silently dropped** by the flow (the webhook still returns `202`, then the Teams post step discards it). 64 KB leaves comfortable headroom for the send-timestamp prefix, UTF-8 multibyte characters, and JSON escaping.
 
 ### Per-webhook outbound queue & pacing
 
-Both endpoints enqueue onto a **per-webhook queue** (`src/services/dispatcher.py`) and return `202` immediately. A background worker per webhook URL drains its queue on a **slot clock** — one send every `per_webhook_min_interval_seconds` (default 0.5s) — and **spawns** each POST so the cadence holds even when a POST is slow. Different webhooks are fully independent (own queue, worker, clock → parallel).
+Both endpoints enqueue onto a **per-webhook queue** (`src/services/dispatcher.py`) and return `202` immediately. A background worker per webhook URL drains its queue on a **slot clock** — one send every `per_webhook_min_interval_seconds` — and **spawns** each POST so the cadence holds even when a POST is slow. Different webhooks are fully independent (own queue, worker, clock → parallel).
 
-Why: Power Automate / Teams throttles bursts to a single webhook (the Flow-bot "Post message / card" action is capped at **25 per 5 minutes**; concurrent posts get dropped). Pacing keeps us from flooding it. On shutdown the dispatcher cancels workers and logs any undrained items; if a queue hits `per_webhook_queue_maxsize` the enqueue returns `503 WEBHOOK_QUEUE_FULL`.
+**Chosen interval: 10 seconds per webhook.** Backpressure: on shutdown the dispatcher cancels workers and logs any undrained items; if a queue hits `per_webhook_queue_maxsize` the enqueue returns `503 WEBHOOK_QUEUE_FULL`.
 
-> Note: 0.5s pacing prevents *burst-concurrency* drops but does not raise the connector's 25-msg/5-min cap — that's a Microsoft-side limit on the Flow-bot post action. At real load (~1 message per event per webhook) you never approach it. For genuine high volume, aggregate into one message or use a Graph/bot integration.
+#### Every message must include its send timestamp
+
+Every outbound message carries the timestamp at which it was actually sent — i.e. the instant the per-webhook worker POSTs it to the webhook (after pacing), **not** the enqueue/`202` time. Teams exposes no per-message delivery timestamp, so an embedded send-time is the only honest reference for "when did we send this" and for measuring the gap until it appears in the chat.
+
+The dispatcher (`_with_send_timestamp` in `src/services/dispatcher.py`) prepends a line like `[sent 2026-05-23 13:48:14 PDT]` to each plain-text message **just before the POST**, so the stamp is the actual post-pacing send moment (which, behind a 10s queue, can be well after enqueue). The time is **California / America-Los_Angeles, DST-aware** (needs the `tzdata` package, included in deps). Adaptive-Card payloads are not stamped.
+
+#### Throttle findings (measured 2026-05-23)
+
+Measured by POSTing 64 KB plain messages directly to the plain "Post message" webhook (`tests/e2e/plain_text_throttle_probe.py` in the notification-system repo):
+
+| Rate over a 300s window | Result |
+|---|---|
+| 25 / 300s (12s and 9s spacing) | all delivered, prompt, in order |
+| 34 / 300s (9s spacing) | all delivered, prompt, in order |
+| 60 / 300s (5s spacing) | all 60 delivered (none lost); #1–55 prompt & in order, then #56–60 delayed and **reordered** (one sent first arrived last) |
+
+- **The plain "Post message in a chat or channel" action is NOT bound by 25 / 5 min.** That cap is the **Adaptive-Card "post as Flow bot"** limit (the old card path — the cause of the original "30 of 50" loss). Plain-text posts sit in Microsoft's much looser "other operations" bucket, which is why 60-in-300s mostly sailed through.
+- **Nothing is dropped** at any tested rate — the platform **delays/reorders** under stress rather than discarding. So under burst, **arrival order is not guaranteed** (closely-spaced messages can land out of order — observed at 5s).
+- The throttle is a **sliding (rolling) window**, not a fixed bucket that resets on a clock boundary.
+
+#### Why 10 seconds (and why < 12s is fine on the plain path)
+
+Treat the rolling window as a sequence: at spacing `T` the steady-state count in a 300s window is ≈ `300/T`. `T = 12s` is exactly 25/300s; anything faster pushes the rolling count above the 25 threshold and, on a *strict* 25/300s bucket, would trend toward throttling over time (slowly — it "converges late"). 10s (≈30/300s) is safe anyway for two reasons:
+
+1. **The plain path's real ceiling is far above 25/300s** (see findings) — 10s sits well inside it; the 9s/34-per-300s run was already clean.
+2. **Real load is sparse.** You rarely get a message in every consecutive 10s slot, and a single quiet window lets the rolling count fall back toward zero — resetting any accumulation before it can build. So even the theoretical drift never gets a chance to bite.
 
 ---
 
@@ -415,7 +444,7 @@ Every non-2xx response uses the same envelope:
 | `LOG_FORMAT`                  | `json`              | `json` (prod) or `pretty` (dev)                 |
 | `HTTPX_TIMEOUT_SECONDS`       | `15`                | Per-request outbound timeout                    |
 | `WEBHOOK_MAX_RETRIES`         | `2`                 | Retries for timeouts / network / 5xx only       |
-| `PER_WEBHOOK_MIN_INTERVAL_SECONDS` | `0.5`         | Min spacing between consecutive POSTs to the **same** webhook (per-webhook queue pacing) |
+| `PER_WEBHOOK_MIN_INTERVAL_SECONDS` | `10`          | Min spacing between consecutive POSTs to the **same** webhook (per-webhook queue pacing) — the chosen plain-message cadence. See [pacing](#per-webhook-outbound-queue--pacing). |
 | `PER_WEBHOOK_QUEUE_MAXSIZE`   | `1000`              | Max pending items per per-webhook queue; over this, enqueue → `503` |
 | `CORS_ALLOW_ORIGINS`          | `["*"]`             | JSON list (via pydantic-settings)               |
 | `ENV_FILE`                    | `./.env`            | Override path (for Docker volume mounts)        |
@@ -431,7 +460,7 @@ teams:
 http:
   timeout_seconds: 15
   max_retries: 2
-  per_webhook_min_interval_seconds: 0.5   # pace sends to the same webhook
+  per_webhook_min_interval_seconds: 10    # pace sends to the same webhook (10s per webhook)
   per_webhook_queue_maxsize: 1000         # backpressure -> 503 when full
 api:
   cors:

@@ -119,9 +119,9 @@ class TeamsTextMessage(BaseSchema):
 
     text: str = Field(
         ...,
-        description="The message text. Sent verbatim; Teams renders light Markdown. Newlines (\\n) are preserved.",
+        description="The message text. Sent verbatim; Teams renders light Markdown. Newlines (\\n) are preserved. Anything over the 64 KB per-message budget is split into multiple <=64 KB messages by the service (see split_text_for_teams).",
         min_length=1,
-        max_length=28000,   # ~28 KB ceiling, matching the Teams message size limit
+        max_length=262144,  # 256 KiB safety ceiling; the real per-MESSAGE size is 64 KB, enforced by splitting (the plain path silently drops >~100 KB)
         examples=["Stroke alert: accession COCSNV0001 unassigned for 2 min."],
     )
 

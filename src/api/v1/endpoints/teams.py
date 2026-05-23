@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request, status
 from src.api.deps import RequestIdDep, TeamsServiceDep
 from src.schemas.common import ErrorResponse
 from src.schemas.teams import SendMessageResponse, TeamsMessage, TeamsTextMessage
-from src.services.teams import render_card
+from src.services.teams import render_card, split_text_for_teams
 
 
 router = APIRouter(prefix="/teams", tags=["teams"])
@@ -89,9 +89,13 @@ async def send_teams_text(
     `{"text": ...}` payload to the per-webhook queue and return 202. The actual
     POST happens in the background, paced — same dispatcher as the card path."""
     url = teams.resolve_webhook_url(message.webhook_url, message.webhook_target)  # may raise -> 400
-    request.app.state.dispatcher.enqueue(                # may raise WebhookQueueFull -> 503
-        url=url, payload={"text": message.text}, request_id=request_id,
-    )
+    # Split anything over the 64 KB per-message budget into multiple parts; each
+    # part is enqueued separately and paced like any other send. (The dispatcher
+    # stamps each part with its actual send time just before POSTing.)
+    for part in split_text_for_teams(message.text):
+        request.app.state.dispatcher.enqueue(            # may raise WebhookQueueFull -> 503
+            url=url, payload={"text": part}, request_id=request_id,
+        )
     return SendMessageResponse(
         message_id   = request_id or "",
         sent_at      = datetime.now(timezone.utc),       # enqueue time (not the actual send)

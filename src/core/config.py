@@ -145,7 +145,7 @@ class Settings(BaseSettings):
     webhook_max_retries:   int   = Field(2,    description="How many times a retryable webhook failure (timeout/network/5xx) is retried before giving up.")
 
     # ---- per-webhook outbound pacing (queue) ----
-    per_webhook_min_interval_seconds: float = Field(0.5,  description="Minimum spacing (seconds) between consecutive POSTs to the SAME webhook. Each webhook is paced independently by its own background queue so a burst doesn't get throttled/dropped downstream (Power Automate/Teams).")
+    per_webhook_min_interval_seconds: float = Field(10.0, description="Minimum spacing (seconds) between consecutive POSTs to the SAME webhook. Each webhook is paced independently by its own background queue so a burst doesn't get throttled/dropped downstream (Power Automate/Teams). 10s is the chosen plain-message cadence — comfortably inside the measured throttle envelope.")
     per_webhook_queue_maxsize:        int   = Field(1000, description="Max pending items per-webhook queue. When full, the enqueue is rejected with 503 rather than silently dropped. Generous by design — effectively never hit at real load.")
 
     # ---- CORS ----
