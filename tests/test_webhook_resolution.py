@@ -6,17 +6,16 @@ Webhook resolution priority:
   3. DEFAULT_TEAMS_WEBHOOK_URL from .env                              (lowest)
 
 Also verifies the 'nothing configured anywhere' failure mode.
+
+The endpoint is fire-and-forget (202 + background delivery), so we assert which
+URL the endpoint RESOLVED by capturing what it hands to the queue
+(`dispatcher.enqueue`), rather than observing a synchronous POST.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-
-import httpx
-import respx
-
-from tests.conftest import TEST_DEFAULT_WEBHOOK
 
 
 NAMED_URL    = "https://teams.example.com/webhook/named-one"
@@ -35,36 +34,39 @@ def _write_yaml_with_named(named_url: str) -> None:
     )
 
 
-@respx.mock
-def test_named_webhook_target_is_resolved_from_yaml(client, env_overrides) -> None:
-    """webhook_target: 'alerts' -> looks up the URL in config/app.yaml and POSTs there."""
-    _write_yaml_with_named(NAMED_URL)
-    env_overrides()   # reloads settings so the new YAML is visible
+def _capture_enqueue(client, monkeypatch) -> dict:
+    """Replace the dispatcher's enqueue with a recorder; return the dict it fills."""
+    captured: dict = {}
+    monkeypatch.setattr(client.app.state.dispatcher, "enqueue", lambda **kw: captured.update(kw))
+    return captured
 
-    route = respx.post(NAMED_URL).mock(return_value=httpx.Response(200))
+
+def test_named_webhook_target_is_resolved_from_yaml(client, env_overrides, monkeypatch) -> None:
+    """webhook_target: 'alerts' -> resolves to the URL registered in config/app.yaml."""
+    _write_yaml_with_named(NAMED_URL)
+    env_overrides()   # clears settings cache so the new YAML is visible to the next request
+
+    captured = _capture_enqueue(client, monkeypatch)
 
     r = client.post(
         "/api/v1/teams/messages",
         json = {"title": {"text": "hi"}, "webhook_target": "alerts"},
     )
-    assert r.status_code == 200
-    assert route.called, "service must POST to the URL registered under 'alerts'"
+    assert r.status_code == 202
+    assert captured["url"] == NAMED_URL, "must resolve to the URL registered under 'alerts'"
     assert r.json()["webhook_host"] == "teams.example.com"
 
 
-@respx.mock
-def test_explicit_webhook_url_overrides_default(client) -> None:
-    """When webhook_url is supplied, the default is not touched."""
-    route_default  = respx.post(TEST_DEFAULT_WEBHOOK).mock(return_value=httpx.Response(200))
-    route_override = respx.post(OVERRIDE_URL).mock(return_value=httpx.Response(200))
+def test_explicit_webhook_url_overrides_default(client, monkeypatch) -> None:
+    """When webhook_url is supplied, it wins over the configured default."""
+    captured = _capture_enqueue(client, monkeypatch)
 
     r = client.post(
         "/api/v1/teams/messages",
         json = {"title": {"text": "hi"}, "webhook_url": OVERRIDE_URL},
     )
-    assert r.status_code == 200
-    assert route_override.called
-    assert not route_default.called, "default must not be used when webhook_url is explicit"
+    assert r.status_code == 202
+    assert captured["url"] == OVERRIDE_URL, "explicit webhook_url must override the default"
 
 
 def test_no_default_and_no_request_selector_yields_unknown_target(client, env_overrides) -> None:

@@ -105,6 +105,37 @@ class TeamsMessage(BaseSchema):
         return self
 
 
+class TeamsTextMessage(BaseSchema):
+    """
+    A plain-text Teams message request (no Adaptive Card).
+
+    The service posts ``{"text": <text>}`` to the webhook — meant for a Power
+    Automate "Post message in a chat or channel" flow that maps the body's
+    ``text`` field (e.g. ``trigger().outputs.body.text``) into the message. The
+    text is sent as-is; Teams renders light Markdown (bold, italics, links,
+    line breaks). Webhook selection follows the same rules as
+    :class:`TeamsMessage`.
+    """
+
+    text: str = Field(
+        ...,
+        description="The message text. Sent verbatim; Teams renders light Markdown. Newlines (\\n) are preserved.",
+        min_length=1,
+        max_length=28000,   # ~28 KB ceiling, matching the Teams message size limit
+        examples=["Stroke alert: accession COCSNV0001 unassigned for 2 min."],
+    )
+
+    webhook_target: Optional[str]     = Field(None, description="Name of a pre-configured webhook in config/app.yaml. Mutually exclusive with webhook_url.")
+    webhook_url:    Optional[HttpUrl] = Field(None, description="One-off webhook URL that overrides every configured target. Mutually exclusive with webhook_target.")
+
+    @model_validator(mode="after")
+    def _exactly_one_webhook_selector(self) -> "TeamsTextMessage":
+        """Forbid sending both webhook_target and webhook_url in the same request."""
+        if self.webhook_target is not None and self.webhook_url is not None:
+            raise ValueError("Provide either 'webhook_target' or 'webhook_url', not both.")
+        return self
+
+
 class SendMessageResponse(BaseSchema):
     """Success response returned after a message is delivered to Teams."""
 

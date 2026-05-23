@@ -97,6 +97,10 @@ class YamlConfigSource(PydanticBaseSettingsSource):
             flat["httpx_timeout_seconds"] = http["timeout_seconds"]
         if http.get("max_retries") is not None:
             flat["webhook_max_retries"] = http["max_retries"]
+        if http.get("per_webhook_min_interval_seconds") is not None:
+            flat["per_webhook_min_interval_seconds"] = http["per_webhook_min_interval_seconds"]
+        if http.get("per_webhook_queue_maxsize") is not None:
+            flat["per_webhook_queue_maxsize"] = http["per_webhook_queue_maxsize"]
 
         cors = (api.get("cors") or {})
         if cors.get("allow_origins") is not None:
@@ -139,6 +143,10 @@ class Settings(BaseSettings):
     # ---- HTTP client ----
     httpx_timeout_seconds: float = Field(15.0, description="Timeout (seconds) applied to every outbound webhook POST.")
     webhook_max_retries:   int   = Field(2,    description="How many times a retryable webhook failure (timeout/network/5xx) is retried before giving up.")
+
+    # ---- per-webhook outbound pacing (queue) ----
+    per_webhook_min_interval_seconds: float = Field(0.5,  description="Minimum spacing (seconds) between consecutive POSTs to the SAME webhook. Each webhook is paced independently by its own background queue so a burst doesn't get throttled/dropped downstream (Power Automate/Teams).")
+    per_webhook_queue_maxsize:        int   = Field(1000, description="Max pending items per-webhook queue. When full, the enqueue is rejected with 503 rather than silently dropped. Generous by design — effectively never hit at real load.")
 
     # ---- CORS ----
     cors_allow_origins: list[str] = Field(default_factory=lambda: ["*"], description="Origins allowed to call the API from a browser.")
@@ -249,6 +257,8 @@ def snapshot_settings(settings: Settings) -> dict[str, Any]:
         "cors_allow_origins":        list(settings.cors_allow_origins),
         "httpx_timeout_seconds":     settings.httpx_timeout_seconds,
         "webhook_max_retries":       settings.webhook_max_retries,
+        "per_webhook_min_interval_seconds": settings.per_webhook_min_interval_seconds,
+        "per_webhook_queue_maxsize":        settings.per_webhook_queue_maxsize,
         "default_teams_webhook_url": mask_webhook(settings.default_teams_webhook_url),
         "admin_api_key_configured":  bool(settings.admin_api_key),
         "named_webhooks":            {name: mask_webhook(url) for name, url in settings.named_webhooks.items()},

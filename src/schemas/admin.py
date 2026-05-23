@@ -47,6 +47,8 @@ class SettingsSnapshot(BaseSchema):
     cors_allow_origins:        list[str] = Field(..., description="Allowed CORS origins.")
     httpx_timeout_seconds:     float     = Field(..., description="Timeout applied to every webhook POST.")
     webhook_max_retries:       int       = Field(..., description="How many times a retryable webhook failure is retried before surfacing.")
+    per_webhook_min_interval_seconds: float = Field(..., description="Minimum spacing between consecutive POSTs to the same webhook (per-webhook outbound queue).")
+    per_webhook_queue_maxsize:        int   = Field(..., description="Max pending items per per-webhook queue before enqueue is rejected with 503.")
     default_teams_webhook_url: str       = Field(..., description="Default webhook URL, masked.")
     admin_api_key_configured:  bool      = Field(..., description="True if ADMIN_API_KEY is set (actual value is never returned).")
     named_webhooks:            dict[str, str] = Field(..., description="Named webhook targets from YAML, with URL signatures masked.")

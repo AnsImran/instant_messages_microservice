@@ -1,6 +1,11 @@
 # microservice-instant-messages
 
-A small web service that takes a plain-English description of a message and delivers it to a Microsoft Teams chat as a nicely-styled card. You tell it "banner with red alert, title in bold, a row of ticket info, two buttons at the bottom" and it figures out all the Adaptive Card JSON, sends it to Teams, and tells you whether it worked.
+A small web service that delivers messages to a Microsoft Teams chat. Two ways to send:
+
+- **Adaptive Card** (`POST /api/v1/teams/messages`) — describe "banner with red alert, title in bold, a row of ticket info, two buttons" and it builds the Adaptive Card JSON for you.
+- **Plain text** (`POST /api/v1/teams/text`) — send `{"text": "..."}` and it posts it as a plain message (for a Power Automate "Post message" flow that maps `body.text`). Teams renders light Markdown; newlines preserved.
+
+**Delivery is queued and fire-and-forget.** A request is validated, the webhook is resolved, the payload is built, and then **handed to a per-webhook queue and acknowledged with `202 queued` immediately**. A background worker drains each webhook's queue on a fixed cadence (`per_webhook_min_interval_seconds`, default 0.5s) so a burst to one webhook isn't throttled/dropped downstream by Power Automate / Teams. Each webhook is paced independently.
 
 Built on FastAPI. Containerised. Deployed to EC2 through GitHub Actions. Everything is wired up for production: configuration, logging, retries, health checks, admin endpoints, tests.
 
@@ -10,37 +15,45 @@ Built on FastAPI. Containerised. Deployed to EC2 through GitHub Actions. Everyth
 
 This is what happens from the moment a caller decides to send a message, to the moment the card appears in Teams. Every shape in this picture is a real thing inside the service; the language is deliberately non-technical.
 
+The request path is now **fire-and-forget**: the caller gets a `202 queued` the moment the message is accepted into the per-webhook queue. The actual POST to Teams happens later, in a background worker, paced per webhook.
+
 ```mermaid
 flowchart TD
     start(["A caller decides to send a message to a Teams chat"])
-    start --> post["The caller sends an HTTP POST request<br/>with the message described in JSON"]
+    start --> post["HTTP POST<br/>(Adaptive Card -> /teams/messages,<br/>or plain text -> /teams/text)"]
 
-    subgraph service ["Inside the service (running on the EC2 server)"]
+    subgraph service ["Request path — returns 202 immediately"]
       direction TB
-      post   --> stamp["Stamp the request with a unique ticket number<br/>(every log line for this request will carry that number<br/>so we can trace everything later)"]
-      stamp  --> check{"Does the request<br/>look complete and valid?<br/>(e.g. title present, no empty rows,<br/>URLs look like URLs, etc.)"}
-      check  -- "No — something is missing or wrong" --> rejectBad["Send a polite rejection back with the ticket number<br/>and a clear list of what's wrong"]
-      check  -- "Yes — form looks good" --> pickWebhook["Decide which Teams webhook to deliver to<br/>• explicit webhook_url on the request, OR<br/>• named webhook_target from config/app.yaml, OR<br/>• the server's default webhook"]
-      pickWebhook --> paint["Paint the Adaptive Card from the message description<br/>(banner, title, rows, buttons,<br/>aligned columns, colors, bold, inline links)"]
-      paint  --> deliver["Deliver the card to Microsoft Teams"]
-      deliver --> teamsAnswer{"Did Teams<br/>accept the card?"}
-      teamsAnswer -- "Yes (HTTP 200)" --> ok["Return a success note with<br/>the ticket number and a timestamp"]
-      teamsAnswer -- "Teams is slow / network hiccup / Teams 5xx" --> retry["Wait a short moment,<br/>then try again<br/>(exponential backoff, up to N tries)"]
-      retry --> deliver
-      teamsAnswer -- "Teams refused (4xx) or retries exhausted" --> rejectDown["Return a polite failure note<br/>with the ticket number<br/>(the full trace goes to the logs, not the caller)"]
+      post   --> stamp["Stamp the request with a unique ticket number"]
+      stamp  --> check{"Does the request look valid?"}
+      check  -- "No" --> rejectBad["Reject (422 / 4xx) with the ticket number"]
+      check  -- "Yes" --> pickWebhook["Resolve which webhook to deliver to<br/>(webhook_url / webhook_target / default)"]
+      pickWebhook --> build["Build the payload:<br/>Adaptive Card (/messages) or {text} (/text)"]
+      build  --> enqueue{"Room in this webhook's queue?"}
+      enqueue -- "No (full)" --> q503["Reject 503 WEBHOOK_QUEUE_FULL"]
+      enqueue -- "Yes" --> accepted["Enqueue + return 202 'queued'"]
     end
 
-    ok          --> land(["The card appears in the Teams chat"])
-    rejectBad   --> sawError(["Caller sees an error response<br/>with the ticket number"])
-    rejectDown  --> sawError
+    accepted --> caller(["Caller is done — has its 202"])
 
-    classDef happy fill:#d4f4dd,stroke:#2a7a3d,color:#113a1b
-    classDef bad   fill:#ffe0e0,stroke:#a11818,color:#3b0a0a
-    classDef step  fill:#eef3ff,stroke:#2b4a8f,color:#142445
-    class start,land happy
-    class rejectBad,rejectDown,sawError bad
-    class stamp,check,pickWebhook,paint,deliver,teamsAnswer,retry,ok,post step
+    subgraph worker ["Background worker — one per webhook URL, paced"]
+      direction TB
+      slot["Wait for the next paced slot<br/>(>= per_webhook_min_interval_seconds apart)"]
+      slot --> deliver["POST the payload to Teams"]
+      deliver --> teamsAnswer{"Accepted?"}
+      teamsAnswer -- "Yes" --> logok["Log webhook_delivered"]
+      teamsAnswer -- "Slow / 5xx / network" --> retry["Backoff + retry (up to N)"]
+      retry --> deliver
+      teamsAnswer -- "4xx or retries exhausted" --> logfail["Log webhook_delivery_failed (swallowed)"]
+    end
+
+    accepted -. "picked up later, paced" .-> slot
+    logok --> land(["The message appears in the Teams chat"])
+    rejectBad --> sawError(["Caller sees an error response"])
+    q503 --> sawError
 ```
+
+Note the consequence of fire-and-forget: a delivery that fails *after* the 202 (4xx, or retries exhausted) is **logged server-side, not returned to the caller**. The caller only learns of failures that happen *before* the 202 (validation 422, unknown target 400, queue full 503).
 
 Two supporting cycles worth mentioning that don't fit in the flow above:
 
@@ -78,7 +91,9 @@ flowchart TD
 
     subgraph SVC ["🛠️ Service layer — the worker who does the job"]
       direction TB
-      svc["<b>services/teams.py</b><br/><i>the craftsman: paints the Adaptive Card<br/>from the request, delivers it to Teams,<br/>retries if Teams is slow, reports back</i>"]
+      svc["<b>services/teams.py</b><br/><i>the craftsman: paints the Adaptive Card<br/>(or renders {text}), delivers it to Teams,<br/>retries if Teams is slow</i>"]
+      disp["<b>services/dispatcher.py</b><br/><i>the dispatcher: one paced queue + worker<br/>per webhook URL. Endpoints enqueue here<br/>and return 202; it drains each webhook<br/>~0.5s apart, fire-and-forget</i>"]
+      disp --> svc
     end
 
     subgraph CORE ["🧱 Core — the building's infrastructure"]
@@ -106,6 +121,9 @@ flowchart TD
     appmain --> mw
     appmain --> log
     appmain --> cfg
+    appmain --> disp
+
+    ep_teams  --> disp
 
     deps      --> cfg
     deps      --> excs
@@ -131,7 +149,7 @@ flowchart TD
     classDef sch     fill:#fdecef,stroke:#b42d4b,color:#4c0c1c
     class root,appmain entry
     class router,ep_teams,ep_health,ep_admin,ep_meta,deps api
-    class svc svc
+    class svc,disp svc
     class cfg,log,mw,handlers,excs core
     class sch_teams,sch_admin,sch_common,sch_enums sch
 ```
@@ -143,12 +161,13 @@ flowchart TD
 | `main.py` (repo root) | The one-button launcher. Starts the web server. Nothing else. |
 | `src/main.py` | Assembles all the pieces — middleware, error handlers, routes — and hands you a ready-to-serve app. |
 | `src/api/v1/router.py` | A directory that says "health calls go here, Teams calls go there, admin calls go in that corner." |
-| `src/api/v1/endpoints/teams.py` | The window that accepts "please send this to Teams" requests. |
+| `src/api/v1/endpoints/teams.py` | The windows that accept send requests: `/messages` (Adaptive Card) and `/text` (plain text). Each resolves the webhook, builds the payload, hands it to the dispatcher, and returns **202 queued**. |
 | `src/api/v1/endpoints/health.py` | The bell other systems ring to ask "are you up? are you ready?" |
 | `src/api/v1/endpoints/admin.py` | Manager-only. Reload config from disk, show the current settings (with secrets hidden). Needs the admin key. |
 | `src/api/v1/endpoints/meta.py` | Like the little plate next to your doorbell: name of the service, version. |
 | `src/api/deps.py` | The shared toolbox every endpoint reaches into — settings, the Teams worker, the admin-key check, request id. |
-| `src/services/teams.py` | The actual worker: turns your message description into an Adaptive Card and delivers it to Teams. Retries on flaky networks, gives up on bad requests. |
+| `src/services/teams.py` | Renders the Adaptive Card from your description, resolves the webhook (`resolve_webhook_url`), and performs the actual POST with retry/backoff (`post_rendered`, called by the dispatcher's worker). Retries on flaky networks / 5xx, never on 4xx. |
+| `src/services/dispatcher.py` | The per-webhook outbound **queue**. One `asyncio.Queue` + one background worker per webhook URL; the worker fires sends on a fixed cadence (≥ `per_webhook_min_interval_seconds`) so a burst to one webhook isn't throttled downstream. Created at startup (lifespan), drained in the background, fire-and-forget. Raises `WebhookQueueFull` when a queue is at capacity. |
 | `src/core/config.py` | Reads `.env` and `config/app.yaml`. Remembers the values. Can reload from disk on demand without a restart. Masks secrets when you ask for a settings snapshot. |
 | `src/core/logging.py` | Decides how log lines look. JSON in production (for log shippers), readable for local development. |
 | `src/core/middleware.py` | Stamps every request with a unique ticket number, then writes one line in the journal per request with how long it took and how it ended. |
@@ -163,7 +182,7 @@ flowchart TD
 | `Dockerfile` | Recipe for building the container image. |
 | `docker-compose.yml` | How to run the container on the server (port mapping, volume mounts, restart policy, healthcheck). |
 | `.github/workflows/ci.yml` | The automatic pipeline: on every push to `main`, run tests, and if *code* changed, build the image, push it to the registry, and deploy to EC2. |
-| `tests/` | 31 tests — card rendering, every API endpoint, every error path, admin-key rules, config reload. |
+| `tests/` | 58 tests — card rendering, both send endpoints (card + text), the 202 enqueue contract, per-webhook queue **pacing + independence + queue-full**, retry/exception mapping (service level), admin-key rules, config reload. |
 | `artifacts/` | Historical reference only. Contains the original one-file script this whole project grew out of, plus a ready-made smoke-test payload. |
 
 ---
@@ -171,6 +190,8 @@ flowchart TD
 ## Features
 
 - **High-level message DSL** — describe banners, rows (left / right / both), buttons, inline markdown links; the service builds the Adaptive Card JSON for you.
+- **Plain-text path** — `POST /api/v1/teams/text` sends `{"text": "..."}` as a plain Teams message (for a Power Automate "Post message" flow). Same webhook selection + same queue as cards.
+- **Per-webhook outbound queue (fire-and-forget)** — both endpoints **enqueue and return `202 queued` instantly**; a background worker per webhook URL paces sends (≥ `per_webhook_min_interval_seconds`, default 0.5s) so a burst to one webhook isn't throttled/dropped by Power Automate / Teams. Different webhooks run in parallel; a full queue returns `503 WEBHOOK_QUEUE_FULL`.
 - **API versioning** — everything lives under `/api/v1/...`.
 - **Config from `.env` + YAML** — both files are mountable as Docker volumes and reloadable without a restart.
 - **Typed exception hierarchy** — every failure gets a stable `code` and a uniform `ErrorResponse` envelope.
@@ -252,8 +273,10 @@ Required repo secrets (set once via `gh secret set`):
 │   │   ├── exceptions.py      # typed AppError hierarchy
 │   │   └── handlers.py        # global exception handlers
 │   ├── schemas/               # Pydantic models with Field descriptions
-│   └── services/teams.py      # render_card + send + retry + exception mapping
-├── tests/                     # 31 tests
+│   └── services/
+│       ├── teams.py           # render_card + resolve_webhook_url + post_rendered (retry/exception mapping)
+│       └── dispatcher.py      # per-webhook queue + paced background workers (fire-and-forget)
+├── tests/                     # 58 tests
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .github/workflows/ci.yml
@@ -272,9 +295,12 @@ All endpoints are under `/api/v1`.
 |   GET  | `/health`              | Liveness probe (always 200 while the process is up) |
 |   GET  | `/health/ready`        | Readiness probe (200 once the lifespan has run)     |
 |   GET  | `/version`             | Returns `{name, version}` from settings             |
-|  POST  | `/teams/messages`      | Send an Adaptive Card to a Teams webhook            |
+|  POST  | `/teams/messages`      | Enqueue an **Adaptive Card** for a Teams webhook → `202 queued` |
+|  POST  | `/teams/text`          | Enqueue a **plain-text** message (`{"text": ...}`) → `202 queued` |
 |  POST  | `/admin/reload-config` | Reload `.env` + YAML from disk (needs `X-Admin-Key`) |
 |   GET  | `/admin/config`        | Current settings, secrets masked (needs `X-Admin-Key`) |
+
+> **Both send endpoints are fire-and-forget:** they return `202 {"status":"queued"}` once the message is accepted into the per-webhook queue. The POST to Teams happens later in the background, paced. Failures *after* the 202 are logged server-side, not returned.
 
 ### POST `/api/v1/teams/messages`
 
@@ -310,6 +336,29 @@ Webhook selection priority:
 2. `webhook_target` — look up in `config/app.yaml` -> `teams.named_webhooks`.
 3. `DEFAULT_TEAMS_WEBHOOK_URL` from `.env`.
 
+Response (both endpoints): `202` with `{"message_id", "sent_at", "webhook_host", "status": "queued"}`. `sent_at` is the **enqueue** time, not the actual send.
+
+### POST `/api/v1/teams/text`
+
+Plain text (no card). Posts `{"text": <text>}` to the webhook — for a Power Automate **"Post message in a chat or channel"** flow that maps the body's `text` field (e.g. `trigger().outputs.body.text`) into the message:
+
+```json
+{
+  "text": "Stroke alert: accession COCSNV0001 unassigned for 2 min.\nPlease pick it up.",
+  "webhook_target": "superstat"
+}
+```
+
+Same webhook-selection priority as `/messages`. Teams renders light Markdown (bold, italics, links); `\n` newlines are preserved. Max ~28 KB (the Teams message size limit).
+
+### Per-webhook outbound queue & pacing
+
+Both endpoints enqueue onto a **per-webhook queue** (`src/services/dispatcher.py`) and return `202` immediately. A background worker per webhook URL drains its queue on a **slot clock** — one send every `per_webhook_min_interval_seconds` (default 0.5s) — and **spawns** each POST so the cadence holds even when a POST is slow. Different webhooks are fully independent (own queue, worker, clock → parallel).
+
+Why: Power Automate / Teams throttles bursts to a single webhook (the Flow-bot "Post message / card" action is capped at **25 per 5 minutes**; concurrent posts get dropped). Pacing keeps us from flooding it. On shutdown the dispatcher cancels workers and logs any undrained items; if a queue hits `per_webhook_queue_maxsize` the enqueue returns `503 WEBHOOK_QUEUE_FULL`.
+
+> Note: 0.5s pacing prevents *burst-concurrency* drops but does not raise the connector's 25-msg/5-min cap — that's a Microsoft-side limit on the Flow-bot post action. At real load (~1 message per event per webhook) you never approach it. For genuine high volume, aggregate into one message or use a Graph/bot integration.
+
 ---
 
 ## What the card DSL supports
@@ -344,14 +393,13 @@ Every non-2xx response uses the same envelope:
 |-------------------------|-----:|-------------------------------------------------|
 | `VALIDATION_ERROR`      |  422 | Request body failed schema/validator            |
 | `UNKNOWN_WEBHOOK_TARGET`|  400 | Named webhook not configured                    |
-| `WEBHOOK_TIMEOUT`       |  504 | httpx timed out                                 |
-| `WEBHOOK_NETWORK_ERROR` |  502 | DNS / connect / TLS / read error                |
-| `WEBHOOK_REJECTED`      |  502 | Teams returned 4xx (not retried)                |
-| `WEBHOOK_SERVER_ERROR`  |  502 | Teams returned 5xx (after retries)              |
+| `WEBHOOK_QUEUE_FULL`    |  503 | This webhook's outbound queue is at capacity     |
 | `ADMIN_KEY_MISSING`     |  503 | Server has no ADMIN_API_KEY set                 |
 | `ADMIN_KEY_INVALID`     |  401 | Wrong or missing X-Admin-Key                    |
 | `CONFIG_INVALID`        |  500 | Malformed YAML at reload time                   |
 | `INTERNAL_ERROR`        |  500 | Anything unexpected (full trace logged, generic message returned) |
+
+> **Delivery errors are no longer returned to the caller.** Because delivery is queued/fire-and-forget, the webhook failures `WEBHOOK_TIMEOUT` / `WEBHOOK_NETWORK_ERROR` / `WEBHOOK_REJECTED` (4xx) / `WEBHOOK_SERVER_ERROR` (5xx) now happen in the background worker and are **logged server-side** (`webhook_delivery_failed`), not surfaced in the HTTP response. The response only carries errors that occur *before* the 202 (above).
 
 ---
 
@@ -367,6 +415,8 @@ Every non-2xx response uses the same envelope:
 | `LOG_FORMAT`                  | `json`              | `json` (prod) or `pretty` (dev)                 |
 | `HTTPX_TIMEOUT_SECONDS`       | `15`                | Per-request outbound timeout                    |
 | `WEBHOOK_MAX_RETRIES`         | `2`                 | Retries for timeouts / network / 5xx only       |
+| `PER_WEBHOOK_MIN_INTERVAL_SECONDS` | `0.5`         | Min spacing between consecutive POSTs to the **same** webhook (per-webhook queue pacing) |
+| `PER_WEBHOOK_QUEUE_MAXSIZE`   | `1000`              | Max pending items per per-webhook queue; over this, enqueue → `503` |
 | `CORS_ALLOW_ORIGINS`          | `["*"]`             | JSON list (via pydantic-settings)               |
 | `ENV_FILE`                    | `./.env`            | Override path (for Docker volume mounts)        |
 | `CONFIG_FILE`                 | `./config/app.yaml` | Override YAML path                              |
@@ -381,6 +431,8 @@ teams:
 http:
   timeout_seconds: 15
   max_retries: 2
+  per_webhook_min_interval_seconds: 0.5   # pace sends to the same webhook
+  per_webhook_queue_maxsize: 1000         # backpressure -> 503 when full
 api:
   cors:
     allow_origins: ["*"]
@@ -407,8 +459,9 @@ uv run pytest
 
 The suite covers:
 - card rendering (every DSL permutation -> expected JSON)
-- HTTP endpoints (happy path + every error code)
-- webhook failure mapping (timeout / network / 4xx / 5xx)
+- both send endpoints — card (`/messages`) + plain text (`/text`) — the **202 enqueue contract**, webhook resolution, queue-full `503`
+- the **dispatcher**: exact pacing to one webhook, per-webhook independence (parallel), queue-full → `WebhookQueueFull`, shutdown-rejects
+- webhook failure/retry mapping (timeout / network / 4xx / 5xx) at the **service level** (`TeamsService.send`), where that logic now runs for the queue worker
 - admin-key enforcement
 - config reload from a mutated YAML on disk
 - uniform error envelope + internal-error leak prevention

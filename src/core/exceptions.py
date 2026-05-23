@@ -161,3 +161,16 @@ class WebhookServerError(WebhookError):
     code        = "WEBHOOK_SERVER_ERROR"
     http_status = 502
     message     = "The Teams webhook failed with a server error (5xx)."
+
+
+class WebhookQueueFull(AppError):
+    """The per-webhook outbound queue is at capacity — the message was NOT accepted.
+
+    Raised at enqueue time when a single webhook's pending queue has hit
+    `per_webhook_queue_maxsize`. Surfaced as 503 (backpressure) so a
+    pathological flood is visible to the caller rather than silently dropped.
+    """
+
+    code        = "WEBHOOK_QUEUE_FULL"
+    http_status = 503
+    message     = "The per-webhook outbound queue is full; try again shortly."

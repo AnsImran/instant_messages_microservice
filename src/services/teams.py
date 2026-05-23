@@ -179,24 +179,30 @@ class TeamsService:
 
     # -- webhook resolution -------------------------------------------------
     def resolve_webhook(self, message: TeamsMessage) -> str:
+        """Resolve the webhook for a card request. Thin wrapper over
+        :meth:`resolve_webhook_url` so the card and plain-text paths share the
+        exact same precedence rules."""
+        return self.resolve_webhook_url(message.webhook_url, message.webhook_target)
+
+    def resolve_webhook_url(self, webhook_url: object | None, webhook_target: str | None) -> str:
         """
-        Pick the URL to POST to, honoring the priority documented on `TeamsMessage`.
+        Pick the URL to POST to, honoring the documented precedence.
 
         Order of precedence:
           1. explicit `webhook_url` on the request
           2. `webhook_target` looked up in `named_webhooks`
           3. `DEFAULT_TEAMS_WEBHOOK_URL` from settings
         """
-        if message.webhook_url is not None:
-            return str(message.webhook_url)
+        if webhook_url is not None:
+            return str(webhook_url)
 
-        if message.webhook_target is not None:
-            url = self._settings.named_webhooks.get(message.webhook_target)
+        if webhook_target is not None:
+            url = self._settings.named_webhooks.get(webhook_target)
             if url is None:
                 raise UnknownWebhookTarget(
-                    message = f"No webhook named '{message.webhook_target}' is configured.",
+                    message = f"No webhook named '{webhook_target}' is configured.",
                     details = {
-                        "requested":      message.webhook_target,
+                        "requested":      webhook_target,
                         "available":      sorted(self._settings.named_webhooks.keys()),
                     },
                 )
@@ -235,6 +241,23 @@ class TeamsService:
             webhook_host = host,
             status       = "sent",
         )
+
+    async def post_rendered(
+        self,
+        *,
+        url:        str,
+        payload:    dict[str, Any],
+        request_id: str | None = None,
+    ) -> None:
+        """Deliver an ALREADY-resolved URL + ALREADY-rendered payload, reusing the
+        exact retry / typed-exception behaviour of `send()`.
+
+        Used by the per-webhook queue worker (`WebhookDispatcher`): the endpoint
+        resolves the webhook + renders the card synchronously at enqueue time, and
+        the worker calls this later to perform the paced POST. Raises the same
+        `Webhook*` errors as `send()` on final failure.
+        """
+        await self._post_with_retry(url=url, payload=payload, request_id=request_id)
 
     # -- HTTP with retry, one call per attempt -----------------------------
     async def _post_with_retry(

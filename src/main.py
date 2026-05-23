@@ -21,6 +21,7 @@ from src.core.config import Settings, get_settings
 from src.core.handlers import register_exception_handlers
 from src.core.logging import configure_logging
 from src.core.middleware import AccessLogMiddleware, RequestIDMiddleware
+from src.services.dispatcher import WebhookDispatcher
 
 
 _logger = logging.getLogger("main")
@@ -37,9 +38,21 @@ def _build_lifespan(settings: Settings):
         """Create the shared httpx client on startup; close it on shutdown (always)."""
         try:
             app.state.http = httpx.AsyncClient(timeout=settings.httpx_timeout_seconds)
+            # Per-webhook outbound queue: paces sends to each webhook so bursts
+            # aren't throttled/dropped downstream. Owns background worker tasks.
+            app.state.dispatcher = WebhookDispatcher(
+                http         = app.state.http,
+                settings     = settings,
+                min_interval = settings.per_webhook_min_interval_seconds,
+                maxsize      = settings.per_webhook_queue_maxsize,
+            )
             _logger.info("startup_complete", extra={"path": "/", "method": "LIFESPAN", "status": 0})
             yield
         finally:
+            # Drain/cancel the dispatcher BEFORE closing the client it uses.
+            dispatcher = getattr(app.state, "dispatcher", None)
+            if dispatcher is not None:
+                await dispatcher.aclose()
             client = getattr(app.state, "http", None)
             if client is not None:
                 await client.aclose()
