@@ -115,9 +115,10 @@ async def test_enqueue_raises_queue_full_at_capacity(monkeypatch) -> None:
         await http.aclose()
 
 
-async def test_text_payload_is_timestamped_before_post(monkeypatch) -> None:
-    """The dispatcher prepends a California send-time stamp to text payloads,
-    right before the POST (so it reflects the actual post-pacing send moment)."""
+async def test_text_payload_delivered_verbatim(monkeypatch) -> None:
+    """The dispatcher delivers text payloads VERBATIM -- no auto-prepended
+    send-time stamp. Callers (e.g. the worklist notification system's PCR-5
+    combined message) embed their own timestamp in the body if they want one."""
     disp, http = await _make_dispatcher(min_interval=0.0)
     seen: list[dict] = []
 
@@ -128,10 +129,7 @@ async def test_text_payload_is_timestamped_before_post(monkeypatch) -> None:
     try:
         disp.enqueue(url="https://hook.example/T", payload={"text": "body"}, request_id="t")
         await _wait_for(lambda: len(seen) == 1)
-        sent = seen[0]["text"]
-        assert sent.endswith("body")
-        assert sent.startswith("[sent ")          # a stamp was prepended
-        assert sent != "body"
+        assert seen[0] == {"text": "body"}
     finally:
         await disp.aclose()
         await http.aclose()

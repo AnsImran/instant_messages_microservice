@@ -361,11 +361,9 @@ Both endpoints enqueue onto a **per-webhook queue** (`src/services/dispatcher.py
 
 **Chosen interval: 10 seconds per webhook.** Backpressure: on shutdown the dispatcher cancels workers and logs any undrained items; if a queue hits `per_webhook_queue_maxsize` the enqueue returns `503 WEBHOOK_QUEUE_FULL`.
 
-#### Every message must include its send timestamp
+#### Send timestamps are the caller's responsibility
 
-Every outbound message carries the timestamp at which it was actually sent — i.e. the instant the per-webhook worker POSTs it to the webhook (after pacing), **not** the enqueue/`202` time. Teams exposes no per-message delivery timestamp, so an embedded send-time is the only honest reference for "when did we send this" and for measuring the gap until it appears in the chat.
-
-The dispatcher (`_with_send_timestamp` in `src/services/dispatcher.py`) prepends a line like `[sent 2026-05-23 13:48:14 PDT]` to each plain-text message **just before the POST**, so the stamp is the actual post-pacing send moment (which, behind a 10s queue, can be well after enqueue). The time is **California / America-Los_Angeles, DST-aware** (needs the `tzdata` package, included in deps). Adaptive-Card payloads are not stamped.
+The dispatcher delivers payloads VERBATIM — no auto-prepended `[sent …]` stamp. Earlier this service stamped every plain-text payload with the post-pacing send time, but the worklist notification system's PCR-5 combined message now carries its own `<b>Date & Time:</b>` header, and the duplicate looked like a bug in Teams. If another caller needs a send-time embedded in the chat message, it must include one in the `text` body itself.
 
 #### Throttle findings (measured 2026-05-23)
 

@@ -35,10 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
-from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -50,23 +48,6 @@ _logger = logging.getLogger("dispatcher")
 
 # Queue item: (rendered payload, request_id).
 _Item = tuple[dict[str, Any], Optional[str]]
-
-# Every outbound message is stamped with its ACTUAL send time (the moment we POST,
-# after pacing) in California time. Teams exposes no per-message delivery
-# timestamp, so this embedded stamp is the only record of when we sent it.
-_LOS_ANGELES = ZoneInfo("America/Los_Angeles")
-
-
-def _with_send_timestamp(payload: dict[str, Any]) -> dict[str, Any]:
-    """Prepend the actual send time (America/Los_Angeles, DST-aware) to a
-    plain-text payload, right before the POST. Non-text payloads (Adaptive Cards)
-    are returned unchanged."""
-    if "text" not in payload:
-        return payload
-    now = datetime.now(_LOS_ANGELES)
-    stamp = f"[sent {now:%Y-%m-%d %H:%M:%S %Z}]\n"
-    return {**payload, "text": stamp + str(payload["text"])}
-
 
 class WebhookDispatcher:
     """Owns one paced queue + worker per webhook URL. Created once in the
@@ -175,8 +156,11 @@ class WebhookDispatcher:
         Fire-and-forget: success and failure are logged; nothing is raised. The
         log line's timestamp is the authoritative 'posted to the webhook' time."""
         try:
-            stamped = _with_send_timestamp(payload)
-            await self._teams.post_rendered(url=url, payload=stamped, request_id=request_id)
+            # Payload is delivered VERBATIM. Callers that want a send-time
+            # stamp embedded in their text body must include one themselves
+            # (the worklist notification system's PCR-5 combined message
+            # already does so via its "<b>Date & Time:</b>" header).
+            await self._teams.post_rendered(url=url, payload=payload, request_id=request_id)
             _logger.info(
                 "webhook_delivered",
                 extra={"path": f"webhook:{host}", "method": "POST", "request_id": request_id},
