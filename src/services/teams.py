@@ -17,6 +17,7 @@ import asyncio
 import logging
 import random
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -26,6 +27,7 @@ from src.core.config import Settings, mask_webhook
 from src.core.exceptions import (
     UnknownWebhookTarget,
     WebhookNetworkError,
+    WebhookRateLimited,
     WebhookRejected,
     WebhookServerError,
     WebhookTimeout,
@@ -42,6 +44,32 @@ from src.schemas.teams import (
 
 
 _logger = logging.getLogger("services.teams")
+
+
+def _parse_retry_after(response: httpx.Response) -> float | None:
+    """Read a 429 response's `Retry-After` header into a number of seconds.
+
+    The header comes in two forms: a plain count of seconds, or an HTTP-date by
+    which the caller may try again. We try the number first, then the date
+    (treating a tz-naive date as UTC and clamping a past date to 0). Anything
+    unparseable returns None so the caller falls back to normal backoff.
+    """
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return None
+    # Form 1: a bare seconds value (e.g. "5").
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    # Form 2: an HTTP-date (e.g. "Wed, 21 Oct 2026 07:28:00 GMT").
+    try:
+        when = parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -322,11 +350,17 @@ class TeamsService:
             try:
                 await self._post_once(url=url, payload=payload, request_id=request_id)
                 return
-            except (WebhookTimeout, WebhookNetworkError, WebhookServerError) as exc:
+            except (WebhookTimeout, WebhookNetworkError, WebhookServerError, WebhookRateLimited) as exc:
                 last_exc = exc
                 if attempt >= attempts:
                     break
+                # Default: exponential backoff with jitter (0.5s, 1s, 2s... capped at 4s).
                 delay = min(4.0, (0.5 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.2))
+                # On a 429 with a usable Retry-After, wait exactly what the server asked,
+                # clamped to the configured ceiling so a hostile value can't park the queue.
+                if isinstance(exc, WebhookRateLimited) and exc.retry_after_seconds is not None:
+                    delay = min(float(self._settings.webhook_max_retry_after_seconds),
+                                max(0.0, exc.retry_after_seconds))
                 _logger.warning(
                     "webhook_retry code=%s attempt=%d/%d delay=%.2fs",
                     exc.code, attempt, attempts, delay,
@@ -378,6 +412,19 @@ class TeamsService:
             return
 
         body_excerpt = (response.text or "")[:500]
+
+        # 429 is throttling, NOT a permanent client error — carve it out BEFORE the
+        # generic 4xx branch so it is retried (honoring Retry-After), not dropped.
+        if response.status_code == 429:
+            raise WebhookRateLimited(
+                details = {
+                    "url_masked":   masked,
+                    "status":       429,
+                    "retry_after":  response.headers.get("Retry-After"),
+                    "body_excerpt": body_excerpt,
+                },
+                retry_after_seconds = _parse_retry_after(response),
+            )
 
         if 400 <= response.status_code < 500:
             raise WebhookRejected(

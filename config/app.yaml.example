@@ -23,8 +23,11 @@ teams:
 http:
   # Timeout (seconds) applied to every outbound webhook POST.
   timeout_seconds: 15
-  # Retries on timeout / network error / 5xx. 4xx is never retried.
+  # Retries on timeout / network error / 5xx / 429. Other 4xx is never retried.
   max_retries: 2
+  # Ceiling (seconds) on how long an upstream 429 "Retry-After" is obeyed before
+  # the retry sleep is clamped — stops a hostile/huge value parking the queue.
+  max_retry_after_seconds: 10
 
 api:
   cors:

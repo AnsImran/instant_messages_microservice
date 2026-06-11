@@ -388,6 +388,50 @@ Treat the rolling window as a sequence: at spacing `T` the steady-state count in
 
 ---
 
+## Planned hardening (2026-06-11)
+
+Agreed backlog for this service. This section records *what* and *why*; status is
+marked per item. **Once items 1–2 land, every caller (the notification-system
+`ImClient` and the sibling services) can drop its own client-side per-chat throttle**
+— this forwarder becomes the single place that owns pacing, retries, and rate-limit
+handling, so callers no longer have to care.
+
+1. **Reactive `429` / `Retry-After` handling. ✅ Done (2026-06-11).** A `429 Too Many
+   Requests` from Teams / Power Automate is now a distinct retryable outcome
+   (`WebhookRateLimited`), not a permanent 4xx reject. `_post_once` carves out 429
+   before the generic 4xx branch; `_post_with_retry` waits the parsed `Retry-After`
+   (seconds or HTTP-date) clamped to `webhook_max_retry_after_seconds` (default 10s),
+   falling back to exponential backoff when the header is absent. See
+   `src/services/teams.py` (`_parse_retry_after`, `_post_once`, `_post_with_retry`)
+   and `tests/test_retry_mechanics.py`.
+2. **Strict per-chat serialization.** The worker *spawns* each POST with
+   `asyncio.create_task` and loops without awaiting it (`src/services/dispatcher.py:139`),
+   so two posts to the **same** chat can overlap in flight when one runs slow — it is
+   pacing, not one-at-a-time. Make each per-webhook delivery strictly sequential (await
+   the POST, or hold a per-webhook in-flight lock) so one chat never has two concurrent
+   posts.
+3. **Make delivery failures visible.** Because the endpoint returns `202` and delivery
+   is fire-and-forget, any post-`202` failure (including the dropped `429`) is only
+   logged and swallowed (`src/services/dispatcher.py:152-176`) — the caller is never
+   told. Add an observable outcome: a delivery-status lookup, a dead-letter / metric, or
+   a callback, so drops are not silent.
+4. **Durable, restart-safe queue.** The queue is in-memory and single-process: items
+   still queued at shutdown / crash are lost (`src/services/dispatcher.py:103-119`), and
+   the pacing only holds with a single uvicorn worker. Persist the queue (or move to an
+   external broker), or formally constrain + document the single-worker requirement.
+5. **Inbound authentication + rate limit (send endpoints).** `POST /api/v1/teams/messages`
+   and `/api/v1/teams/text` have **no auth and no rate limit** today — only the localhost
+   bind + nginx protect them; only `/admin/*` is key-guarded. Add a shared API key (or
+   mTLS) and a per-caller inbound rate limit so a misbehaving or compromised caller
+   cannot flood the service (and, transitively, Teams).
+6. **Pacing-interval config drift — decision pending.** The "Why 10 seconds" rationale
+   above says **10s**, and the field default is **10s**, but the deployed
+   `config/app.yaml` overrides to **1.0s** — so the **current running value is 1 second**.
+   Whether to formally align the default (and rewrite the 10s rationale) is **to be
+   decided later**; for now the intended / running value stays **1 second**.
+
+---
+
 ## What the card DSL supports
 
 | DSL feature              | Adaptive Card primitive used                     |

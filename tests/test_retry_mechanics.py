@@ -22,6 +22,7 @@ import respx
 from src.core.config import get_settings
 from src.core.exceptions import (
     WebhookNetworkError,
+    WebhookRateLimited,
     WebhookRejected,
     WebhookServerError,
     WebhookTimeout,
@@ -129,3 +130,95 @@ async def test_max_retries_zero_means_single_attempt(env_overrides) -> None:
     finally:
         await svc._http.aclose()
     assert route.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 429 / Retry-After policy. A 429 is throttling (transient), NOT a permanent 4xx,
+# so it must be RETRIED — waiting the server's Retry-After when present, else
+# exponential backoff. asyncio.sleep is monkeypatched so the tests never wait.
+# ---------------------------------------------------------------------------
+def _capture_sleeps(monkeypatch) -> list[float]:
+    """Replace the retry loop's asyncio.sleep with a no-wait recorder of delays."""
+    delays: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr("src.services.teams.asyncio.sleep", _fake_sleep)
+    return delays
+
+
+@respx.mock
+async def test_persistent_429_with_retry_after_is_retried_and_honors_header(env_overrides, monkeypatch) -> None:
+    """A persistent 429 carrying Retry-After is retried, waiting exactly the header value."""
+    env_overrides(WEBHOOK_MAX_RETRIES="2", WEBHOOK_MAX_RETRY_AFTER_SECONDS="10")
+    delays = _capture_sleeps(monkeypatch)
+    route = respx.post(TEST_DEFAULT_WEBHOOK).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "2"}, text="slow down"),
+    )
+
+    svc = _service()
+    try:
+        with pytest.raises(WebhookRateLimited):
+            await svc.send(TeamsMessage(**MINIMAL_PAYLOAD), request_id="x")
+    finally:
+        await svc._http.aclose()
+    assert route.call_count == 3, "429 must be retried like a 5xx, not dropped like a 4xx"
+    assert delays == [2.0, 2.0], "both inter-attempt waits must honor Retry-After, not exp backoff"
+
+
+@respx.mock
+async def test_429_without_retry_after_falls_back_to_exponential_backoff(env_overrides, monkeypatch) -> None:
+    """A 429 with NO Retry-After is still retried, using the normal exp-backoff shape."""
+    env_overrides(WEBHOOK_MAX_RETRIES="2")
+    delays = _capture_sleeps(monkeypatch)
+    route = respx.post(TEST_DEFAULT_WEBHOOK).mock(return_value=httpx.Response(429, text="slow"))
+
+    svc = _service()
+    try:
+        with pytest.raises(WebhookRateLimited):
+            await svc.send(TeamsMessage(**MINIMAL_PAYLOAD), request_id="x")
+    finally:
+        await svc._http.aclose()
+    assert route.call_count == 3
+    # delay = 0.5 * 2^(attempt-1) + jitter[0,0.2): attempt1 -> [0.5,0.7], attempt2 -> [1.0,1.2]
+    assert len(delays) == 2
+    assert 0.5 <= delays[0] <= 0.7
+    assert 1.0 <= delays[1] <= 1.2
+
+
+@respx.mock
+async def test_429_then_200_recovers_on_retry(env_overrides, monkeypatch) -> None:
+    """A single 429 then 200 succeeds on the second attempt."""
+    env_overrides(WEBHOOK_MAX_RETRIES="2")
+    _capture_sleeps(monkeypatch)
+    route = respx.post(TEST_DEFAULT_WEBHOOK).mock(
+        side_effect=[httpx.Response(429, headers={"Retry-After": "1"}), httpx.Response(200)],
+    )
+
+    svc = _service()
+    try:
+        resp = await svc.send(TeamsMessage(**MINIMAL_PAYLOAD), request_id="x")
+    finally:
+        await svc._http.aclose()
+    assert resp.status == "sent"
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_429_retry_after_is_clamped_to_configured_ceiling(env_overrides, monkeypatch) -> None:
+    """A hostile/huge Retry-After is clamped to webhook_max_retry_after_seconds."""
+    env_overrides(WEBHOOK_MAX_RETRIES="1", WEBHOOK_MAX_RETRY_AFTER_SECONDS="5")
+    delays = _capture_sleeps(monkeypatch)
+    route = respx.post(TEST_DEFAULT_WEBHOOK).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "3600"}),
+    )
+
+    svc = _service()
+    try:
+        with pytest.raises(WebhookRateLimited):
+            await svc.send(TeamsMessage(**MINIMAL_PAYLOAD), request_id="x")
+    finally:
+        await svc._http.aclose()
+    assert route.call_count == 2
+    assert delays == [5.0], "an hour-long Retry-After must be clamped to the 5s ceiling"

@@ -163,6 +163,32 @@ class WebhookServerError(WebhookError):
     message     = "The Teams webhook failed with a server error (5xx)."
 
 
+class WebhookRateLimited(WebhookError):
+    """Teams returned 429 — we are being throttled. Retryable; the retry waits
+    the server-supplied `Retry-After` when present, else falls back to backoff.
+
+    Unlike a generic 4xx (`WebhookRejected`), throttling is transient: the same
+    request will succeed once we wait. The parsed `Retry-After` (seconds) is
+    carried on the instance so `_post_with_retry` can honor it.
+    """
+
+    code        = "WEBHOOK_RATE_LIMITED"
+    http_status = 429
+    message     = "The Teams webhook rate-limited the request (429)."
+
+    def __init__(
+        self,
+        message: Optional[str]             = None,
+        *,
+        details:             Optional[dict[str, Any]] = None,
+        retry_after_seconds: Optional[float]          = None,
+    ) -> None:
+        super().__init__(message, details=details)
+        # Parsed Retry-After in seconds (None when the server sent no usable header);
+        # consumed by the retry loop to decide how long to wait before re-sending.
+        self.retry_after_seconds = retry_after_seconds
+
+
 class WebhookQueueFull(AppError):
     """The per-webhook outbound queue is at capacity — the message was NOT accepted.
 

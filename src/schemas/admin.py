@@ -47,6 +47,7 @@ class SettingsSnapshot(BaseSchema):
     cors_allow_origins:        list[str] = Field(..., description="Allowed CORS origins.")
     httpx_timeout_seconds:     float     = Field(..., description="Timeout applied to every webhook POST.")
     webhook_max_retries:       int       = Field(..., description="How many times a retryable webhook failure is retried before surfacing.")
+    webhook_max_retry_after_seconds:  float = Field(..., description="Ceiling (seconds) on how long an upstream 429 Retry-After is honored before the retry sleep is clamped.")
     per_webhook_min_interval_seconds: float = Field(..., description="Minimum spacing between consecutive POSTs to the same webhook (per-webhook outbound queue).")
     per_webhook_queue_maxsize:        int   = Field(..., description="Max pending items per per-webhook queue before enqueue is rejected with 503.")
     default_teams_webhook_url: str       = Field(..., description="Default webhook URL, masked.")

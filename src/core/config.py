@@ -97,6 +97,8 @@ class YamlConfigSource(PydanticBaseSettingsSource):
             flat["httpx_timeout_seconds"] = http["timeout_seconds"]
         if http.get("max_retries") is not None:
             flat["webhook_max_retries"] = http["max_retries"]
+        if http.get("max_retry_after_seconds") is not None:
+            flat["webhook_max_retry_after_seconds"] = http["max_retry_after_seconds"]
         if http.get("per_webhook_min_interval_seconds") is not None:
             flat["per_webhook_min_interval_seconds"] = http["per_webhook_min_interval_seconds"]
         if http.get("per_webhook_queue_maxsize") is not None:
@@ -142,7 +144,8 @@ class Settings(BaseSettings):
 
     # ---- HTTP client ----
     httpx_timeout_seconds: float = Field(15.0, description="Timeout (seconds) applied to every outbound webhook POST.")
-    webhook_max_retries:   int   = Field(2,    description="How many times a retryable webhook failure (timeout/network/5xx) is retried before giving up.")
+    webhook_max_retries:   int   = Field(2,    description="How many times a retryable webhook failure (timeout/network/5xx/429) is retried before giving up.")
+    webhook_max_retry_after_seconds: float = Field(10.0, description="Upper bound (seconds) on how long an upstream 429 'Retry-After' header is honored before the retry sleep is clamped. Caps a hostile/huge Retry-After so a single webhook's queue cannot be parked for too long (the queue is held while a serialized delivery retries).")
 
     # ---- per-webhook outbound pacing (queue) ----
     per_webhook_min_interval_seconds: float = Field(10.0, description="Minimum spacing (seconds) between consecutive POSTs to the SAME webhook. Each webhook is paced independently by its own background queue so a burst doesn't get throttled/dropped downstream (Power Automate/Teams). 10s is the chosen plain-message cadence — comfortably inside the measured throttle envelope.")
@@ -257,6 +260,7 @@ def snapshot_settings(settings: Settings) -> dict[str, Any]:
         "cors_allow_origins":        list(settings.cors_allow_origins),
         "httpx_timeout_seconds":     settings.httpx_timeout_seconds,
         "webhook_max_retries":       settings.webhook_max_retries,
+        "webhook_max_retry_after_seconds":  settings.webhook_max_retry_after_seconds,
         "per_webhook_min_interval_seconds": settings.per_webhook_min_interval_seconds,
         "per_webhook_queue_maxsize":        settings.per_webhook_queue_maxsize,
         "default_teams_webhook_url": mask_webhook(settings.default_teams_webhook_url),
