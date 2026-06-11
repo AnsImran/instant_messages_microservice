@@ -31,6 +31,15 @@ http:
   # Max recent terminal delivery failures kept for GET /admin/dead-letters.
   dead_letter_capacity: 200
 
+  # Durable outbox: when enabled, the per-webhook queue is mirrored to a SQLite
+  # file so items survive a restart/crash (at-least-once delivery). OFF by
+  # default. Requires a SINGLE uvicorn worker + a writable data volume (the
+  # compose file mounts one). db_path is RESTART-ONLY (not hot-reloadable).
+  queue:
+    persistence_enabled: false
+    db_path: data/outbox.sqlite3
+    max_attempts: 10
+
 api:
   cors:
     # Origins allowed to call the API from a browser.

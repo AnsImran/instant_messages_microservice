@@ -23,6 +23,7 @@ from src.core.logging import configure_logging
 from src.core.middleware import AccessLogMiddleware, RequestIDMiddleware
 from src.services.dead_letter import DeadLetterStore
 from src.services.dispatcher import WebhookDispatcher
+from src.services.queue_store import SqliteQueueStore
 from src.services.ratelimit import InMemoryRateLimiter
 
 
@@ -46,6 +47,11 @@ def _build_lifespan(settings: Settings):
             # Per-caller token-bucket limiter for the send endpoints. Built always
             # (cheap); only consulted when send_rate_limit_enabled is true.
             app.state.rate_limiter = InMemoryRateLimiter()
+            # Durable outbox (off by default). When on, the queue survives restarts:
+            # items persist on enqueue and the row is deleted only after delivery.
+            app.state.queue_store = (
+                SqliteQueueStore(settings.queue_db_path) if settings.queue_persistence_enabled else None
+            )
             # Per-webhook outbound queue: paces sends to each webhook so bursts
             # aren't throttled/dropped downstream. Owns background worker tasks.
             app.state.dispatcher = WebhookDispatcher(
@@ -54,7 +60,11 @@ def _build_lifespan(settings: Settings):
                 min_interval = settings.per_webhook_min_interval_seconds,
                 maxsize      = settings.per_webhook_queue_maxsize,
                 dead_letter  = app.state.dead_letter,
+                store        = app.state.queue_store,
             )
+            # Replay anything left undelivered from a previous run BEFORE serving.
+            if app.state.queue_store is not None:
+                app.state.dispatcher.restore_from_store(max_attempts=settings.queue_max_attempts)
             _logger.info("startup_complete", extra={"path": "/", "method": "LIFESPAN", "status": 0})
             yield
         finally:
@@ -66,6 +76,10 @@ def _build_lifespan(settings: Settings):
             if client is not None:
                 await client.aclose()
                 _logger.info("shutdown_complete", extra={"path": "/", "method": "LIFESPAN", "status": 0})
+            # Close the durable outbox connection last (after the dispatcher that uses it).
+            store = getattr(app.state, "queue_store", None)
+            if store is not None:
+                store.close()
 
     return lifespan
 

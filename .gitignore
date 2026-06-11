@@ -25,6 +25,12 @@ id_rsa.*
 # Runtime config (contains webhook URLs in production). The *.example version is committed.
 config/app.yaml
 
+# Durable-outbox SQLite DB (holds resolved webhook URLs incl. sig= tokens). Secret-bearing.
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
 # Tooling
 .pytest_cache/
 .ruff_cache/

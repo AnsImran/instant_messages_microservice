@@ -106,6 +106,14 @@ class YamlConfigSource(PydanticBaseSettingsSource):
         if http.get("dead_letter_capacity") is not None:
             flat["dead_letter_capacity"] = http["dead_letter_capacity"]
 
+        queue_cfg = (http.get("queue") or {})
+        if queue_cfg.get("persistence_enabled") is not None:
+            flat["queue_persistence_enabled"] = queue_cfg["persistence_enabled"]
+        if queue_cfg.get("db_path") is not None:
+            flat["queue_db_path"] = queue_cfg["db_path"]
+        if queue_cfg.get("max_attempts") is not None:
+            flat["queue_max_attempts"] = queue_cfg["max_attempts"]
+
         cors = (api.get("cors") or {})
         if cors.get("allow_origins") is not None:
             flat["cors_allow_origins"] = cors["allow_origins"]
@@ -174,6 +182,11 @@ class Settings(BaseSettings):
 
     # ---- observability ----
     dead_letter_capacity: int = Field(200, description="Max in-memory dead-letter records kept for GET /admin/dead-letters before the oldest are evicted. Best-effort 'recent drops' window (lost on restart).")
+
+    # ---- durable outbox (off by default; opt-in per deployment) ----
+    queue_persistence_enabled: bool = Field(False, description="When true, the per-webhook queue is mirrored to a SQLite outbox so items survive a restart/crash (at-least-once delivery). Default false = pure in-memory. Requires a SINGLE uvicorn worker + a writable data volume.")
+    queue_db_path:             str  = Field("data/outbox.sqlite3", description="SQLite outbox path (relative to the app working dir / mounted volume). RESTART-ONLY: opened once at startup, not hot-reloadable.")
+    queue_max_attempts:        int  = Field(10, description="Max times a persisted item is replayed across restarts before it is dropped + dead-lettered as a poison row.")
 
     # ---- CORS ----
     cors_allow_origins: list[str] = Field(default_factory=lambda: ["*"], description="Origins allowed to call the API from a browser.")
@@ -288,6 +301,9 @@ def snapshot_settings(settings: Settings) -> dict[str, Any]:
         "per_webhook_min_interval_seconds": settings.per_webhook_min_interval_seconds,
         "per_webhook_queue_maxsize":        settings.per_webhook_queue_maxsize,
         "dead_letter_capacity":             settings.dead_letter_capacity,
+        "queue_persistence_enabled":        settings.queue_persistence_enabled,
+        "queue_db_path":                    settings.queue_db_path,
+        "queue_max_attempts":               settings.queue_max_attempts,
         "default_teams_webhook_url": mask_webhook(settings.default_teams_webhook_url),
         "admin_api_key_configured":  bool(settings.admin_api_key),
         "send_api_key_configured":   bool(settings.send_api_key),

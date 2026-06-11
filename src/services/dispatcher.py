@@ -45,12 +45,15 @@ from src.core import metrics
 from src.core.config import Settings
 from src.core.exceptions import AppError, WebhookQueueFull
 from src.services.dead_letter import DeadLetterStore
+from src.services.queue_store import SqliteQueueStore
 from src.services.teams import TeamsService
 
 _logger = logging.getLogger("dispatcher")
 
-# Queue item: (rendered payload, request_id).
-_Item = tuple[dict[str, Any], Optional[str]]
+# Queue item: (outbox row id or None, rendered payload, request_id). The row id
+# is set when durable persistence is on, so the worker can DELETE the row only
+# after a successful delivery.
+_Item = tuple[Optional[int], dict[str, Any], Optional[str]]
 
 class WebhookDispatcher:
     """Owns one paced queue + worker per webhook URL. Created once in the
@@ -63,13 +66,17 @@ class WebhookDispatcher:
         settings:     Settings,
         min_interval: float,
         maxsize:      int,
-        dead_letter:  Optional[DeadLetterStore] = None,
+        dead_letter:  Optional[DeadLetterStore]  = None,
+        store:        Optional[SqliteQueueStore] = None,
     ) -> None:
         self._teams        = TeamsService(http=http, settings=settings)
         self._min_interval = max(0.0, float(min_interval))
         self._maxsize      = int(maxsize)
         # Optional ring of recent terminal failures (visibility; see _deliver).
         self._dead_letter  = dead_letter
+        # Optional durable outbox: when set, items are persisted on enqueue and
+        # the row is deleted only after a successful delivery (at-least-once).
+        self._store        = store
         self._queues:   dict[str, asyncio.Queue[_Item]] = {}
         self._workers:  dict[str, asyncio.Task[None]]   = {}
         self._closing  = False
@@ -90,6 +97,9 @@ class WebhookDispatcher:
                 details = {"webhook_host": urlparse(url).hostname or ""},
             )
 
+        # Persist BEFORE queueing so a crash right after this can still replay it.
+        row_id = self._store.append(url=url, payload=payload, request_id=request_id) if self._store is not None else None
+
         queue = self._queues.get(url)
         if queue is None:
             queue = asyncio.Queue(maxsize=self._maxsize)
@@ -99,8 +109,11 @@ class WebhookDispatcher:
             )
 
         try:
-            queue.put_nowait((payload, request_id))
+            queue.put_nowait((row_id, payload, request_id))
         except asyncio.QueueFull as exc:
+            # Roll back the row we just wrote so the outbox matches the queue.
+            if self._store is not None and row_id is not None:
+                self._store.delete(row_id)
             raise WebhookQueueFull(
                 details = {"webhook_host": urlparse(url).hostname or "", "maxsize": self._maxsize},
             ) from exc
@@ -120,11 +133,19 @@ class WebhookDispatcher:
             await asyncio.gather(*tasks, return_exceptions=True)
 
         if undrained:
-            _logger.warning(
-                "dispatcher_shutdown_dropped_queued",
-                extra={"path": "/", "method": "LIFESPAN", "status": 0, "dropped": undrained},
-            )
-            metrics.record_dropped("shutdown", undrained)
+            if self._store is None:
+                # No durability: undrained items are genuinely lost.
+                _logger.warning(
+                    "dispatcher_shutdown_dropped_queued",
+                    extra={"path": "/", "method": "LIFESPAN", "status": 0, "dropped": undrained},
+                )
+                metrics.record_dropped("shutdown", undrained)
+            else:
+                # Durable: undrained items stay in the outbox and replay on restart.
+                _logger.info(
+                    "dispatcher_shutdown_persisted_queued",
+                    extra={"path": "/", "method": "LIFESPAN", "status": 0, "persisted": undrained},
+                )
 
     # -- internals ----------------------------------------------------------
     async def _worker(self, url: str, queue: "asyncio.Queue[_Item]") -> None:
@@ -138,7 +159,7 @@ class WebhookDispatcher:
         next_slot = loop.time()
 
         while True:
-            payload, request_id = await queue.get()
+            row_id, payload, request_id = await queue.get()
             try:
                 now  = loop.time()
                 slot = max(now, next_slot)        # idle -> fire now; backlog -> paced
@@ -151,7 +172,7 @@ class WebhookDispatcher:
                 # plus awaiting here means at most ONE POST to this webhook is
                 # ever in flight. A slow POST stretches this webhook's spacing
                 # (bounded by the httpx timeout) but never overlaps.
-                await self._deliver(url, host, payload, request_id)
+                await self._deliver(url, host, row_id, payload, request_id)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — a bug here must not kill the worker
@@ -163,11 +184,13 @@ class WebhookDispatcher:
                 queue.task_done()
 
     async def _deliver(
-        self, url: str, host: str, payload: dict[str, Any], request_id: Optional[str]
+        self, url: str, host: str, row_id: Optional[int], payload: dict[str, Any], request_id: Optional[str]
     ) -> None:
         """Perform one paced POST (reusing the existing retry/exception logic).
         Fire-and-forget: success and failure are logged; nothing is raised. The
-        log line's timestamp is the authoritative 'posted to the webhook' time."""
+        log line's timestamp is the authoritative 'posted to the webhook' time.
+        On success the durable outbox row (if any) is deleted; on failure it is
+        LEFT so the message replays on the next restart (at-least-once)."""
         try:
             # Payload is delivered VERBATIM. Callers that want a send-time
             # stamp embedded in their text body must include one themselves
@@ -179,6 +202,9 @@ class WebhookDispatcher:
                 extra={"path": f"webhook:{host}", "method": "POST", "request_id": request_id},
             )
             metrics.record_delivery_success(host)
+            # Durably done -> drop the outbox row (DELETE only on success).
+            if self._store is not None and row_id is not None:
+                self._store.delete(row_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — fire-and-forget: log + swallow
@@ -199,3 +225,55 @@ class WebhookDispatcher:
                     reason       = reason,
                     detail       = str(getattr(exc, "details", None) or exc),
                 )
+
+    # -- durable replay -----------------------------------------------------
+    def restore_from_store(self, *, max_attempts: int) -> int:
+        """Re-prime the in-memory queues from the durable outbox at startup.
+
+        Rows are replayed per-webhook FIFO. A row already replayed
+        ``max_attempts`` times is treated as poison: dropped + dead-lettered
+        rather than replayed forever. Returns the number of items re-queued.
+        Call from within the running loop, BEFORE serving traffic."""
+        if self._store is None:
+            return 0
+        requeued = 0
+        for row in self._store.load_all():
+            host = urlparse(row.url).hostname or ""
+            if row.attempts >= max_attempts:
+                # Poison row — stop replaying it; record why it was given up on.
+                self._store.delete(row.id)
+                if self._dead_letter is not None:
+                    self._dead_letter.add(
+                        webhook_host = host,
+                        request_id   = row.request_id,
+                        reason       = "MAX_ATTEMPTS",
+                        detail       = f"dropped after {row.attempts} replay attempts",
+                    )
+                _logger.warning(
+                    "outbox_row_dropped_max_attempts",
+                    extra={"path": f"webhook:{host}", "method": "POST", "request_id": row.request_id},
+                )
+                continue
+
+            queue = self._queues.get(row.url)
+            if queue is None:
+                queue = asyncio.Queue(maxsize=self._maxsize)
+                self._queues[row.url] = queue
+                self._workers[row.url] = asyncio.create_task(
+                    self._worker(row.url, queue), name=f"webhook-worker:{host}"
+                )
+            try:
+                queue.put_nowait((row.id, row.payload, row.request_id))
+            except asyncio.QueueFull:
+                # More persisted than maxsize for one webhook: leave the rest in
+                # the outbox (un-incremented) to replay on a later restart.
+                continue
+            self._store.increment_attempts(row.id)
+            requeued += 1
+
+        if requeued:
+            _logger.info(
+                "dispatcher_restored",
+                extra={"path": "/", "method": "LIFESPAN", "status": 0, "requeued": requeued},
+            )
+        return requeued

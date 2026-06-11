@@ -33,7 +33,13 @@ COPY config/ ./config/
 # Final install so the project itself is registered in the venv.
 RUN uv sync --frozen --no-dev
 
+# Data dir for the durable-outbox SQLite file (mounted as a volume in compose).
+RUN mkdir -p /app/data
+
 EXPOSE 8000
 
 # opentelemetry-instrument wraps uvicorn. Inert when OTEL env vars absent.
+# SINGLE worker on purpose: the per-webhook slot-clock pacing, the in-process
+# rate limiter, and the single-writer SQLite outbox all assume one process.
+# Do NOT add --workers >1 without moving queue/pacing state to a shared store.
 CMD ["opentelemetry-instrument", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -421,10 +421,18 @@ handling, so callers no longer have to care.
    **`GET /api/v1/admin/dead-letters`** (admin-key guarded; newest-first + per-reason
    summary). Capacity via `dead_letter_capacity` (default 200). Best-effort /
    in-process (cleared on restart — durability is item 4). See `tests/test_observability.py`.
-4. **Durable, restart-safe queue.** The queue is in-memory and single-process: items
-   still queued at shutdown / crash are lost (`src/services/dispatcher.py:103-119`), and
-   the pacing only holds with a single uvicorn worker. Persist the queue (or move to an
-   external broker), or formally constrain + document the single-worker requirement.
+4. **Durable, restart-safe queue. ✅ Done (2026-06-11), shipped OFF-by-default.** A SQLite
+   WAL outbox (`src/services/queue_store.py`) can mirror the per-webhook queue: items are
+   persisted on enqueue and the row is DELETEd only after a successful delivery, so a
+   restart/crash replays anything undelivered (at-least-once — a crash between POST success
+   and DELETE replays one message; rare, harmless duplicate). `restore_from_store` re-primes
+   the queues at startup before serving; a row replayed `queue_max_attempts` times is dropped
+   + dead-lettered as poison. **Default `queue_persistence_enabled=false`** (pure in-memory),
+   so this deploy changes nothing until enabled. To enable in prod: a Docker named volume
+   (`instant_messages_data:/app/data`) is already mounted, so set `http.queue.persistence_enabled:
+   true` in the host `app.yaml` and restart. **Single uvicorn worker is required** (single-writer
+   SQLite + slot-clock pacing + in-process limiter — noted in the Dockerfile CMD). The DB holds
+   resolved webhook URLs (sig= tokens) → gitignored + secret-bearing. See `tests/test_queue_store.py`.
 5. **Inbound authentication + rate limit (send endpoints). ✅ Done (2026-06-11), shipped
    SAFE-by-default.** `POST /api/v1/teams/messages` and `/api/v1/teams/text` now run two
    gate dependencies (auth first, then rate limit): an `X-Api-Key` check

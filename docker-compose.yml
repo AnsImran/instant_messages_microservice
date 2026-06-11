@@ -14,6 +14,10 @@ services:
       # Mount the YAML config from the host so it can be edited and reloaded
       # via POST /api/v1/admin/reload-config without rebuilding the image.
       - ./config/app.yaml:/app/config/app.yaml:ro
+      # Durable-outbox data dir (used only when queue_persistence_enabled). A
+      # named volume is auto-created by Docker, so this is safe on any host and
+      # survives container recreation. Unused/empty when persistence is off.
+      - instant_messages_data:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).status == 200 else 1)\""]
@@ -21,3 +25,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  # Durable outbox storage (SQLite WAL). Auto-created; persists across deploys.
+  instant_messages_data:
