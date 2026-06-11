@@ -23,6 +23,7 @@ from src.core.logging import configure_logging
 from src.core.middleware import AccessLogMiddleware, RequestIDMiddleware
 from src.services.dead_letter import DeadLetterStore
 from src.services.dispatcher import WebhookDispatcher
+from src.services.ratelimit import InMemoryRateLimiter
 
 
 _logger = logging.getLogger("main")
@@ -42,6 +43,9 @@ def _build_lifespan(settings: Settings):
             # Recent terminal-failure ring, read by GET /admin/dead-letters so a
             # post-202 delivery failure is visible, not silently swallowed.
             app.state.dead_letter = DeadLetterStore(capacity=settings.dead_letter_capacity)
+            # Per-caller token-bucket limiter for the send endpoints. Built always
+            # (cheap); only consulted when send_rate_limit_enabled is true.
+            app.state.rate_limiter = InMemoryRateLimiter()
             # Per-webhook outbound queue: paces sends to each webhook so bursts
             # aren't throttled/dropped downstream. Owns background worker tasks.
             app.state.dispatcher = WebhookDispatcher(

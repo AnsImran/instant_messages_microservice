@@ -425,16 +425,23 @@ handling, so callers no longer have to care.
    still queued at shutdown / crash are lost (`src/services/dispatcher.py:103-119`), and
    the pacing only holds with a single uvicorn worker. Persist the queue (or move to an
    external broker), or formally constrain + document the single-worker requirement.
-5. **Inbound authentication + rate limit (send endpoints).** `POST /api/v1/teams/messages`
-   and `/api/v1/teams/text` have **no auth and no rate limit** today — only the localhost
-   bind + nginx protect them; only `/admin/*` is key-guarded. Add a shared API key (or
-   mTLS) and a per-caller inbound rate limit so a misbehaving or compromised caller
-   cannot flood the service (and, transitively, Teams).
-6. **Pacing-interval config drift — decision pending.** The "Why 10 seconds" rationale
-   above says **10s**, and the field default is **10s**, but the deployed
-   `config/app.yaml` overrides to **1.0s** — so the **current running value is 1 second**.
-   Whether to formally align the default (and rewrite the 10s rationale) is **to be
-   decided later**; for now the intended / running value stays **1 second**.
+5. **Inbound authentication + rate limit (send endpoints). ✅ Done (2026-06-11), shipped
+   SAFE-by-default.** `POST /api/v1/teams/messages` and `/api/v1/teams/text` now run two
+   gate dependencies (auth first, then rate limit): an `X-Api-Key` check
+   (`require_send_key`, constant-time, mirrors the admin-key pattern) and a per-caller
+   token-bucket limiter (`src/services/ratelimit.py`). **Defaults are no-ops:**
+   `send_auth_enforced=false` (grace: accept with/without the key, log adoption via
+   `send_no_key_grace` / `send_key_mismatch_grace`) and `send_rate_limit_enabled=false`.
+   Rollout: distribute `SEND_API_KEY` (.env) to every caller → callers send the header →
+   flip `api.auth.send_enforced: true` (hot-reload). Identity for the limiter is the API
+   key, else client IP. `401 SEND_KEY_INVALID` / `429 RATE_LIMITED`. See
+   `tests/test_send_auth.py`. **NOTE: enforcement is NOT on yet** — turn it on only after
+   the callers (NS `ImClient`, the two report repos) send the key.
+6. **Pacing-interval config drift — RESOLVED (2026-06-11).** Production now explicitly
+   sets `http.per_webhook_min_interval_seconds: 4` in the host `config/app.yaml`, so the
+   **prod running value is 4 seconds** (verified via `/admin/config`). The repo field
+   default remains 10s and the local/dev `config/app.yaml` may differ — that dev↔prod
+   difference is intentional and preserved across deploys (the host config is gitignored).
 
 ---
 

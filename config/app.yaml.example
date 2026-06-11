@@ -36,3 +36,17 @@ api:
     # Origins allowed to call the API from a browser.
     allow_origins:
       - "*"
+
+  # Inbound auth for the /teams send endpoints. The secret key itself lives in
+  # .env (SEND_API_KEY) — NEVER here. Leave send_enforced false during rollout
+  # (grace mode: accept with/without the key, log adoption), flip to true only
+  # after every caller sends a valid X-Api-Key.
+  auth:
+    send_enforced: false
+
+  # Per-caller token-bucket rate limit for the send endpoints. Off by default so
+  # legitimate traffic is never 429'd until the limits are sized for real peak.
+  rate_limit:
+    enabled: false
+    capacity: 120
+    refill_per_sec: 20

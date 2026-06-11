@@ -3,15 +3,25 @@
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Depends, Request, status
 
-from src.api.deps import RequestIdDep, TeamsServiceDep
+from src.api.deps import (
+    RequestIdDep,
+    TeamsServiceDep,
+    require_send_key,
+    require_send_rate_limit,
+)
 from src.schemas.common import ErrorResponse
 from src.schemas.teams import SendMessageResponse, TeamsMessage, TeamsTextMessage
 from src.services.teams import render_card, split_text_for_teams
 
 
 router = APIRouter(prefix="/teams", tags=["teams"])
+
+# Send endpoints share two gate dependencies, evaluated in order: auth FIRST
+# (so an unauthenticated caller never consumes a rate-limit token), then the
+# rate limit. Both are safe no-ops by default (grace auth + limiter disabled).
+_SEND_GUARDS = [Depends(require_send_key), Depends(require_send_rate_limit)]
 
 
 @router.post(
@@ -31,9 +41,12 @@ router = APIRouter(prefix="/teams", tags=["teams"])
     ),
     responses           = {
         400: {"model": ErrorResponse, "description": "Unknown webhook target."},
+        401: {"model": ErrorResponse, "description": "Missing/invalid X-Api-Key (when send auth is enforced)."},
         422: {"model": ErrorResponse, "description": "Request body failed validation."},
+        429: {"model": ErrorResponse, "description": "Per-caller rate limit exceeded (when enabled)."},
         503: {"model": ErrorResponse, "description": "Per-webhook queue is full."},
     },
+    dependencies        = _SEND_GUARDS,
 )
 async def send_teams_message(
     message:    TeamsMessage,
@@ -75,9 +88,12 @@ async def send_teams_message(
     ),
     responses           = {
         400: {"model": ErrorResponse, "description": "Unknown webhook target."},
+        401: {"model": ErrorResponse, "description": "Missing/invalid X-Api-Key (when send auth is enforced)."},
         422: {"model": ErrorResponse, "description": "Request body failed validation."},
+        429: {"model": ErrorResponse, "description": "Per-caller rate limit exceeded (when enabled)."},
         503: {"model": ErrorResponse, "description": "Per-webhook queue is full."},
     },
+    dependencies        = _SEND_GUARDS,
 )
 async def send_teams_text(
     message:    TeamsTextMessage,

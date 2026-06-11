@@ -110,6 +110,18 @@ class YamlConfigSource(PydanticBaseSettingsSource):
         if cors.get("allow_origins") is not None:
             flat["cors_allow_origins"] = cors["allow_origins"]
 
+        # Send-endpoint auth + rate limit (the secret key stays .env-only).
+        auth = (api.get("auth") or {})
+        if auth.get("send_enforced") is not None:
+            flat["send_auth_enforced"] = auth["send_enforced"]
+        rate = (api.get("rate_limit") or {})
+        if rate.get("enabled") is not None:
+            flat["send_rate_limit_enabled"] = rate["enabled"]
+        if rate.get("capacity") is not None:
+            flat["send_rate_capacity"] = rate["capacity"]
+        if rate.get("refill_per_sec") is not None:
+            flat["send_rate_refill_per_sec"] = rate["refill_per_sec"]
+
         return flat
 
     # -- pydantic-settings protocol ----------------------------------------
@@ -139,6 +151,13 @@ class Settings(BaseSettings):
     # ---- secrets / deployment values (typically .env) ----
     default_teams_webhook_url: Optional[str] = Field(None, description="Default Teams webhook URL used when a request omits both webhook_url and webhook_target.")
     admin_api_key:             Optional[str] = Field(None, description="Shared secret required on the X-Admin-Key header for admin endpoints. When empty, admin endpoints return 503.")
+
+    # ---- inbound send-endpoint auth + rate limit (defaults are SAFE no-ops) ----
+    send_api_key:            Optional[str] = Field(None, description="Shared secret required on the X-Api-Key header for the /teams send endpoints WHEN send_auth_enforced is true. .env/secret only, never YAML/logged.")
+    send_auth_enforced:      bool          = Field(False, description="When true, /teams/messages and /teams/text require a valid X-Api-Key (else 401). Default false = grace mode: accept with/without the key and only log adoption, so callers can roll out the header before enforcement.")
+    send_rate_limit_enabled: bool          = Field(False, description="When true, per-caller token-bucket rate limiting is applied to the send endpoints. Default false (off) so legitimate traffic is never 429'd until limits are sized.")
+    send_rate_capacity:      int           = Field(120,   description="Token-bucket burst size per caller (send endpoints). Only used when send_rate_limit_enabled.")
+    send_rate_refill_per_sec: float        = Field(20.0,  description="Token-bucket steady refill (tokens/second) per caller (send endpoints). Only used when send_rate_limit_enabled.")
 
     # ---- observability ----
     log_level:  str = Field("INFO", description="Logger level — DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
@@ -271,6 +290,11 @@ def snapshot_settings(settings: Settings) -> dict[str, Any]:
         "dead_letter_capacity":             settings.dead_letter_capacity,
         "default_teams_webhook_url": mask_webhook(settings.default_teams_webhook_url),
         "admin_api_key_configured":  bool(settings.admin_api_key),
+        "send_api_key_configured":   bool(settings.send_api_key),
+        "send_auth_enforced":        settings.send_auth_enforced,
+        "send_rate_limit_enabled":   settings.send_rate_limit_enabled,
+        "send_rate_capacity":        settings.send_rate_capacity,
+        "send_rate_refill_per_sec":  settings.send_rate_refill_per_sec,
         "named_webhooks":            {name: mask_webhook(url) for name, url in settings.named_webhooks.items()},
         "config_file_path":          str(_resolve_config_file()),
         "env_file_path":             str(_resolve_env_file()),

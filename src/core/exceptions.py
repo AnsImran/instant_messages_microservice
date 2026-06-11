@@ -101,6 +101,26 @@ class AdminKeyInvalid(AuthError):
     message     = "Invalid or missing X-Admin-Key header."
 
 
+class SendKeyInvalid(AuthError):
+    """A send endpoint requires an API key and the caller supplied none / a wrong one.
+
+    Only raised when send-auth enforcement is ON. Returns 401 (not 503) even
+    when the server has no key configured, so an unauthenticated caller cannot
+    distinguish 'no key set' from 'wrong key' (no config-state leak)."""
+
+    code        = "SEND_KEY_INVALID"
+    http_status = 401
+    message     = "Invalid or missing X-Api-Key header."
+
+
+class RateLimited(AppError):
+    """The caller exceeded the per-caller send rate limit (token bucket empty)."""
+
+    code        = "RATE_LIMITED"
+    http_status = 429
+    message     = "Too many requests; slow down."
+
+
 # ---------------------------------------------------------------------------
 # Validation errors that go beyond what pydantic already enforces.
 # ---------------------------------------------------------------------------
