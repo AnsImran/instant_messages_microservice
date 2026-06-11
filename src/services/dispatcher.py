@@ -14,11 +14,12 @@ How it works
 `WebhookDispatcher` keeps, per webhook URL, one `asyncio.Queue` and one
 background worker `asyncio.Task`. Callers `enqueue()` (non-blocking) and the
 endpoint returns 202 immediately; the worker drains its queue on a **slot
-clock** — fire at t0, t0+interval, t0+2·interval, … — so spacing is exact even
-when an individual POST takes longer than the interval. Each POST is *spawned*
-(not awaited) by the worker so a slow delivery never delays the next slot (at the
-default 10s spacing with ~1-2s POSTs they don't normally overlap; the spawn is
-what guarantees one slow POST can't push the next slot late).
+clock** — fire at t0, t0+interval, t0+2·interval, … The worker **awaits** each
+POST before pulling the next item, so a given webhook never has two deliveries
+in flight at once (strict per-webhook serialization). The slot clock paces the
+*start* of each delivery; if a POST runs longer than the interval, the next
+start simply follows its completion (effective spacing = max(interval,
+post-duration), bounded by the httpx timeout × retries).
 
 Different webhooks are fully independent: each has its own queue, worker, and
 slot clock, so they run in parallel.
@@ -66,7 +67,6 @@ class WebhookDispatcher:
         self._maxsize      = int(maxsize)
         self._queues:   dict[str, asyncio.Queue[_Item]] = {}
         self._workers:  dict[str, asyncio.Task[None]]   = {}
-        self._inflight: set[asyncio.Task[None]]         = set()
         self._closing  = False
 
     # -- public API ---------------------------------------------------------
@@ -101,12 +101,14 @@ class WebhookDispatcher:
             ) from exc
 
     async def aclose(self) -> None:
-        """Stop accepting new work, cancel all workers + in-flight deliveries,
-        and log anything left undrained. Called from the lifespan shutdown."""
+        """Stop accepting new work, cancel all workers (which also cancels the
+        POST each is currently awaiting), and log anything left undrained.
+        Called from the lifespan shutdown."""
         self._closing = True
 
         undrained = sum(q.qsize() for q in self._queues.values())
-        tasks = list(self._workers.values()) + list(self._inflight)
+        # One worker per webhook; cancelling it also cancels its in-flight POST.
+        tasks = list(self._workers.values())
         for t in tasks:
             t.cancel()
         if tasks:
@@ -120,8 +122,11 @@ class WebhookDispatcher:
 
     # -- internals ----------------------------------------------------------
     async def _worker(self, url: str, queue: "asyncio.Queue[_Item]") -> None:
-        """Drain ``queue`` on a fixed slot clock; spawn each POST so the cadence
-        is independent of how long a delivery takes."""
+        """Drain ``queue`` on a slot clock, **awaiting** each POST so this one
+        webhook never has two deliveries in flight at once (strict per-webhook
+        serialization). The slot clock paces the START of each delivery; a POST
+        slower than the interval just pushes the next start to its completion.
+        Different webhooks have their own worker and run in parallel."""
         host = urlparse(url).hostname or ""
         loop = asyncio.get_running_loop()
         next_slot = loop.time()
@@ -136,9 +141,11 @@ class WebhookDispatcher:
                 if delay > 0:
                     await asyncio.sleep(delay)
 
-                task = asyncio.create_task(self._deliver(url, host, payload, request_id))
-                self._inflight.add(task)
-                task.add_done_callback(self._inflight.discard)
+                # Await delivery instead of spawning it: one worker per webhook
+                # plus awaiting here means at most ONE POST to this webhook is
+                # ever in flight. A slow POST stretches this webhook's spacing
+                # (bounded by the httpx timeout) but never overlaps.
+                await self._deliver(url, host, payload, request_id)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — a bug here must not kill the worker

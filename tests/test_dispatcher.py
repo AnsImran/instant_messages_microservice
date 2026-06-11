@@ -40,17 +40,17 @@ async def _wait_for(predicate, *, timeout: float = 5.0, step: float = 0.02) -> N
     raise AssertionError("condition not met within timeout")
 
 
-async def test_same_webhook_is_paced_at_the_interval(monkeypatch) -> None:
-    """Cards to ONE webhook fire ~`interval` apart, even when each POST takes
-    LONGER than the interval (proves the worker spawns, not awaits, the POST)."""
+async def test_same_webhook_paced_at_interval_when_posts_are_fast(monkeypatch) -> None:
+    """Fast POSTs (<< interval) to ONE webhook still fire ~`interval` apart — the
+    slot clock keeps pacing the common case (regression guard: serialization did
+    not break normal pacing)."""
     interval = 0.1
     disp, http = await _make_dispatcher(min_interval=interval)
     loop = asyncio.get_running_loop()
     fired_at: list[float] = []
 
     async def fake_post(*, url, payload, request_id):
-        fired_at.append(loop.time())     # record at START (before the slow part)
-        await asyncio.sleep(interval * 3)  # POST slower than the interval
+        fired_at.append(loop.time())     # POST is effectively instant
 
     monkeypatch.setattr(disp._teams, "post_rendered", fake_post)
     try:
@@ -62,10 +62,72 @@ async def test_same_webhook_is_paced_at_the_interval(monkeypatch) -> None:
 
         gaps = [fired_at[i + 1] - fired_at[i] for i in range(len(fired_at) - 1)]
         for g in gaps:
-            assert g >= interval * 0.8, f"too fast — not paced: {gaps}"
-            assert g < interval * 2.5, f"too slow — worker awaited the POST: {gaps}"
+            assert interval * 0.8 <= g < interval * 2.5, f"not paced at interval: {gaps}"
     finally:
         await disp.aclose()
+        await http.aclose()
+
+
+async def test_same_webhook_strictly_serial_when_posts_are_slow(monkeypatch) -> None:
+    """When a POST outlasts the interval, deliveries to ONE webhook never overlap:
+    at most one is in flight, and each next start follows the prior completion."""
+    interval = 0.05
+    post_dur = interval * 4
+    disp, http = await _make_dispatcher(min_interval=interval)
+    loop = asyncio.get_running_loop()
+    active = 0
+    max_active = 0
+    starts: list[float] = []
+
+    async def fake_post(*, url, payload, request_id):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        starts.append(loop.time())
+        try:
+            await asyncio.sleep(post_dur)    # POST slower than the interval
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(disp._teams, "post_rendered", fake_post)
+    try:
+        url = "https://hook.example/slow"
+        for i in range(4):
+            disp.enqueue(url=url, payload={"i": i}, request_id=str(i))
+
+        await _wait_for(lambda: len(starts) == 4, timeout=5.0)
+
+        assert max_active == 1, "same-webhook deliveries overlapped (not serialized)"
+        gaps = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
+        for g in gaps:
+            # serialized: a delivery only starts after the prior POST finishes
+            assert g >= post_dur * 0.8, f"started before prior finished: {gaps}"
+    finally:
+        await disp.aclose()
+        await http.aclose()
+
+
+async def test_aclose_cancels_in_flight_post(monkeypatch) -> None:
+    """aclose() cancels the worker AND the POST it is currently awaiting, so a
+    hung delivery cannot block shutdown (the removed _inflight set is not needed —
+    cancelling the worker propagates into its awaited delivery)."""
+    disp, http = await _make_dispatcher(min_interval=0.0)
+    started = asyncio.Event()
+    completed = False
+
+    async def fake_post(*, url, payload, request_id):
+        nonlocal completed
+        started.set()
+        await asyncio.Event().wait()   # never set -> hangs until cancelled
+        completed = True               # unreachable
+
+    monkeypatch.setattr(disp._teams, "post_rendered", fake_post)
+    try:
+        disp.enqueue(url="https://hook.example/hang", payload={}, request_id="h")
+        await asyncio.wait_for(started.wait(), timeout=2.0)   # delivery is in flight
+        await asyncio.wait_for(disp.aclose(), timeout=2.0)    # must return promptly
+        assert completed is False
+    finally:
         await http.aclose()
 
 

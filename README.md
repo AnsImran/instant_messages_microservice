@@ -404,12 +404,15 @@ handling, so callers no longer have to care.
    falling back to exponential backoff when the header is absent. See
    `src/services/teams.py` (`_parse_retry_after`, `_post_once`, `_post_with_retry`)
    and `tests/test_retry_mechanics.py`.
-2. **Strict per-chat serialization.** The worker *spawns* each POST with
-   `asyncio.create_task` and loops without awaiting it (`src/services/dispatcher.py:139`),
-   so two posts to the **same** chat can overlap in flight when one runs slow — it is
-   pacing, not one-at-a-time. Make each per-webhook delivery strictly sequential (await
-   the POST, or hold a per-webhook in-flight lock) so one chat never has two concurrent
-   posts.
+2. **Strict per-chat serialization. ✅ Done (2026-06-11).** The worker now
+   **awaits** each POST instead of spawning it (`src/services/dispatcher.py`
+   `_worker`), so one webhook never has two deliveries in flight at once. The
+   slot clock still paces the *start* of each delivery; a POST slower than the
+   interval simply pushes the next start to its completion (effective spacing =
+   max(interval, post-duration), bounded by the httpx timeout). Different
+   webhooks remain fully parallel. The `_inflight` set is gone (the worker await
+   is the in-flight holder; `aclose` cancelling the worker cancels its POST).
+   See `tests/test_dispatcher.py` (strict-serial, fast-pacing, aclose-cancel).
 3. **Make delivery failures visible.** Because the endpoint returns `202` and delivery
    is fire-and-forget, any post-`202` failure (including the dropped `429`) is only
    logged and swallowed (`src/services/dispatcher.py:152-176`) — the caller is never
