@@ -413,11 +413,14 @@ handling, so callers no longer have to care.
    webhooks remain fully parallel. The `_inflight` set is gone (the worker await
    is the in-flight holder; `aclose` cancelling the worker cancels its POST).
    See `tests/test_dispatcher.py` (strict-serial, fast-pacing, aclose-cancel).
-3. **Make delivery failures visible.** Because the endpoint returns `202` and delivery
-   is fire-and-forget, any post-`202` failure (including the dropped `429`) is only
-   logged and swallowed (`src/services/dispatcher.py:152-176`) — the caller is never
-   told. Add an observable outcome: a delivery-status lookup, a dead-letter / metric, or
-   a callback, so drops are not silent.
+3. **Make delivery failures visible. ✅ Done (2026-06-11).** A post-`202` delivery
+   failure is no longer only logged-and-swallowed. `_deliver` now emits Prometheus
+   counters on the existing `/metrics` (`webhook_deliveries_total{host,outcome,reason}`,
+   `webhook_dropped_total{reason}` — see `src/core/metrics.py`) AND appends to an
+   in-memory dead-letter ring (`src/services/dead_letter.py`) readable at
+   **`GET /api/v1/admin/dead-letters`** (admin-key guarded; newest-first + per-reason
+   summary). Capacity via `dead_letter_capacity` (default 200). Best-effort /
+   in-process (cleared on restart — durability is item 4). See `tests/test_observability.py`.
 4. **Durable, restart-safe queue.** The queue is in-memory and single-process: items
    still queued at shutdown / crash are lost (`src/services/dispatcher.py:103-119`), and
    the pacing only holds with a single uvicorn worker. Persist the queue (or move to an

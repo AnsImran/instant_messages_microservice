@@ -28,6 +28,8 @@ http:
   # Ceiling (seconds) on how long an upstream 429 "Retry-After" is obeyed before
   # the retry sleep is clamped — stops a hostile/huge value parking the queue.
   max_retry_after_seconds: 10
+  # Max recent terminal delivery failures kept for GET /admin/dead-letters.
+  dead_letter_capacity: 200
 
 api:
   cors:

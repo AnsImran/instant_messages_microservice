@@ -41,8 +41,10 @@ from urllib.parse import urlparse
 
 import httpx
 
+from src.core import metrics
 from src.core.config import Settings
-from src.core.exceptions import WebhookQueueFull
+from src.core.exceptions import AppError, WebhookQueueFull
+from src.services.dead_letter import DeadLetterStore
 from src.services.teams import TeamsService
 
 _logger = logging.getLogger("dispatcher")
@@ -61,10 +63,13 @@ class WebhookDispatcher:
         settings:     Settings,
         min_interval: float,
         maxsize:      int,
+        dead_letter:  Optional[DeadLetterStore] = None,
     ) -> None:
         self._teams        = TeamsService(http=http, settings=settings)
         self._min_interval = max(0.0, float(min_interval))
         self._maxsize      = int(maxsize)
+        # Optional ring of recent terminal failures (visibility; see _deliver).
+        self._dead_letter  = dead_letter
         self._queues:   dict[str, asyncio.Queue[_Item]] = {}
         self._workers:  dict[str, asyncio.Task[None]]   = {}
         self._closing  = False
@@ -119,6 +124,7 @@ class WebhookDispatcher:
                 "dispatcher_shutdown_dropped_queued",
                 extra={"path": "/", "method": "LIFESPAN", "status": 0, "dropped": undrained},
             )
+            metrics.record_dropped("shutdown", undrained)
 
     # -- internals ----------------------------------------------------------
     async def _worker(self, url: str, queue: "asyncio.Queue[_Item]") -> None:
@@ -172,11 +178,24 @@ class WebhookDispatcher:
                 "webhook_delivered",
                 extra={"path": f"webhook:{host}", "method": "POST", "request_id": request_id},
             )
+            metrics.record_delivery_success(host)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — fire-and-forget: log + swallow
+        except Exception as exc:  # noqa: BLE001 — fire-and-forget: log + swallow
+            # A terminal failure here is invisible to the caller (already 202'd),
+            # so make it observable: a counter (always-on) + a dead-letter record
+            # (the "what & why" detail), in addition to the existing log.
+            reason = exc.code if isinstance(exc, AppError) else "UNKNOWN"
             _logger.warning(
                 "webhook_delivery_failed",
                 extra={"path": f"webhook:{host}", "method": "POST", "request_id": request_id},
                 exc_info=True,
             )
+            metrics.record_delivery_failure(host, reason)
+            if self._dead_letter is not None:
+                self._dead_letter.add(
+                    webhook_host = host,
+                    request_id   = request_id,
+                    reason       = reason,
+                    detail       = str(getattr(exc, "details", None) or exc),
+                )

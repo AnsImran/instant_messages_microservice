@@ -21,6 +21,7 @@ from src.core.config import Settings, get_settings
 from src.core.handlers import register_exception_handlers
 from src.core.logging import configure_logging
 from src.core.middleware import AccessLogMiddleware, RequestIDMiddleware
+from src.services.dead_letter import DeadLetterStore
 from src.services.dispatcher import WebhookDispatcher
 
 
@@ -38,6 +39,9 @@ def _build_lifespan(settings: Settings):
         """Create the shared httpx client on startup; close it on shutdown (always)."""
         try:
             app.state.http = httpx.AsyncClient(timeout=settings.httpx_timeout_seconds)
+            # Recent terminal-failure ring, read by GET /admin/dead-letters so a
+            # post-202 delivery failure is visible, not silently swallowed.
+            app.state.dead_letter = DeadLetterStore(capacity=settings.dead_letter_capacity)
             # Per-webhook outbound queue: paces sends to each webhook so bursts
             # aren't throttled/dropped downstream. Owns background worker tasks.
             app.state.dispatcher = WebhookDispatcher(
@@ -45,6 +49,7 @@ def _build_lifespan(settings: Settings):
                 settings     = settings,
                 min_interval = settings.per_webhook_min_interval_seconds,
                 maxsize      = settings.per_webhook_queue_maxsize,
+                dead_letter  = app.state.dead_letter,
             )
             _logger.info("startup_complete", extra={"path": "/", "method": "LIFESPAN", "status": 0})
             yield

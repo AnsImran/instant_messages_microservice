@@ -103,6 +103,8 @@ class YamlConfigSource(PydanticBaseSettingsSource):
             flat["per_webhook_min_interval_seconds"] = http["per_webhook_min_interval_seconds"]
         if http.get("per_webhook_queue_maxsize") is not None:
             flat["per_webhook_queue_maxsize"] = http["per_webhook_queue_maxsize"]
+        if http.get("dead_letter_capacity") is not None:
+            flat["dead_letter_capacity"] = http["dead_letter_capacity"]
 
         cors = (api.get("cors") or {})
         if cors.get("allow_origins") is not None:
@@ -150,6 +152,9 @@ class Settings(BaseSettings):
     # ---- per-webhook outbound pacing (queue) ----
     per_webhook_min_interval_seconds: float = Field(10.0, description="Minimum spacing (seconds) between consecutive POSTs to the SAME webhook. Each webhook is paced independently by its own background queue so a burst doesn't get throttled/dropped downstream (Power Automate/Teams). 10s is the chosen plain-message cadence — comfortably inside the measured throttle envelope.")
     per_webhook_queue_maxsize:        int   = Field(1000, description="Max pending items per-webhook queue. When full, the enqueue is rejected with 503 rather than silently dropped. Generous by design — effectively never hit at real load.")
+
+    # ---- observability ----
+    dead_letter_capacity: int = Field(200, description="Max in-memory dead-letter records kept for GET /admin/dead-letters before the oldest are evicted. Best-effort 'recent drops' window (lost on restart).")
 
     # ---- CORS ----
     cors_allow_origins: list[str] = Field(default_factory=lambda: ["*"], description="Origins allowed to call the API from a browser.")
@@ -263,6 +268,7 @@ def snapshot_settings(settings: Settings) -> dict[str, Any]:
         "webhook_max_retry_after_seconds":  settings.webhook_max_retry_after_seconds,
         "per_webhook_min_interval_seconds": settings.per_webhook_min_interval_seconds,
         "per_webhook_queue_maxsize":        settings.per_webhook_queue_maxsize,
+        "dead_letter_capacity":             settings.dead_letter_capacity,
         "default_teams_webhook_url": mask_webhook(settings.default_teams_webhook_url),
         "admin_api_key_configured":  bool(settings.admin_api_key),
         "named_webhooks":            {name: mask_webhook(url) for name, url in settings.named_webhooks.items()},

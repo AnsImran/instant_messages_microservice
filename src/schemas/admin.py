@@ -8,6 +8,7 @@ the caller.
 """
 
 from datetime import datetime
+from typing import Optional
 
 from pydantic import Field
 
@@ -50,8 +51,28 @@ class SettingsSnapshot(BaseSchema):
     webhook_max_retry_after_seconds:  float = Field(..., description="Ceiling (seconds) on how long an upstream 429 Retry-After is honored before the retry sleep is clamped.")
     per_webhook_min_interval_seconds: float = Field(..., description="Minimum spacing between consecutive POSTs to the same webhook (per-webhook outbound queue).")
     per_webhook_queue_maxsize:        int   = Field(..., description="Max pending items per per-webhook queue before enqueue is rejected with 503.")
+    dead_letter_capacity:             int   = Field(..., description="Max in-memory dead-letter records retained for GET /admin/dead-letters.")
     default_teams_webhook_url: str       = Field(..., description="Default webhook URL, masked.")
     admin_api_key_configured:  bool      = Field(..., description="True if ADMIN_API_KEY is set (actual value is never returned).")
     named_webhooks:            dict[str, str] = Field(..., description="Named webhook targets from YAML, with URL signatures masked.")
     config_file_path:          str       = Field(..., description="Resolved path of the YAML config file the current settings were loaded from.")
     env_file_path:             str       = Field(..., description="Resolved path of the .env file the current settings were loaded from.")
+
+
+class DeadLetterEntry(BaseSchema):
+    """One terminal webhook delivery failure (post-202), for ops inspection."""
+
+    occurred_at:  datetime        = Field(..., description="UTC timestamp when the failure was recorded.")
+    webhook_host: str             = Field(..., description="Host of the webhook the message was destined for.")
+    request_id:   Optional[str]   = Field(None, description="Correlation id of the originating request, if any.")
+    reason:       str             = Field(..., description="Why it failed — the typed Webhook* code, or UNKNOWN.")
+    detail:       Optional[str]   = Field(None, description="Short excerpt of the error (never the full payload / secrets).")
+
+
+class DeadLetterListResponse(BaseSchema):
+    """Returned by GET /admin/dead-letters — recent terminal delivery failures."""
+
+    capacity:       int                  = Field(..., description="Max records retained before the oldest are evicted.")
+    total_recorded: int                  = Field(..., description="Total failures ever recorded this process (including evicted).")
+    summary:        dict[str, int]       = Field(..., description="Count of retained records per reason.")
+    records:        list[DeadLetterEntry] = Field(..., description="Most-recent-first failures, up to the requested limit.")
