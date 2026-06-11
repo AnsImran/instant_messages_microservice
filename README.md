@@ -5,7 +5,7 @@ A small web service that delivers messages to a Microsoft Teams chat. Two ways t
 - **Adaptive Card** (`POST /api/v1/teams/messages`) — describe "banner with red alert, title in bold, a row of ticket info, two buttons" and it builds the Adaptive Card JSON for you.
 - **Plain text** (`POST /api/v1/teams/text`) — send `{"text": "..."}` and it posts it as a plain message (for a Power Automate "Post message" flow that maps `body.text`). Teams renders light Markdown; newlines preserved. Keep messages **≤ 64 KB**; larger requests are split into ≤ 64 KB parts — see [size policy](#post-apiv1teamstext).
 
-**Delivery is queued and fire-and-forget.** A request is validated, the webhook is resolved, the payload is built, and then **handed to a per-webhook queue and acknowledged with `202 queued` immediately**. A background worker drains each webhook's queue on a fixed cadence (`per_webhook_min_interval_seconds`, default 0.5s) so a burst to one webhook isn't throttled/dropped downstream by Power Automate / Teams. Each webhook is paced independently.
+**Delivery is queued and fire-and-forget.** A request is validated, the webhook is resolved, the payload is built, and then **handed to a per-webhook queue and acknowledged with `202 queued` immediately**. A background worker drains each webhook's queue on a fixed cadence (`per_webhook_min_interval_seconds`, field default 10s; production runs 4s) so a burst to one webhook isn't throttled/dropped downstream by Power Automate / Teams. The worker now **awaits** each POST (strict per-webhook serialization — at most one delivery in flight per webhook); different webhooks run in parallel.
 
 Built on FastAPI. Containerised. Deployed to EC2 through GitHub Actions. Everything is wired up for production: configuration, logging, retries, health checks, admin endpoints, tests.
 
@@ -41,10 +41,10 @@ flowchart TD
       slot["Wait for the next paced slot<br/>(>= per_webhook_min_interval_seconds apart)"]
       slot --> deliver["POST the payload to Teams"]
       deliver --> teamsAnswer{"Accepted?"}
-      teamsAnswer -- "Yes" --> logok["Log webhook_delivered"]
-      teamsAnswer -- "Slow / 5xx / network" --> retry["Backoff + retry (up to N)"]
+      teamsAnswer -- "Yes" --> logok["Log webhook_delivered<br/>+ success metric"]
+      teamsAnswer -- "Slow / 5xx / network / 429 (waits Retry-After)" --> retry["Backoff + retry (up to N)"]
       retry --> deliver
-      teamsAnswer -- "4xx or retries exhausted" --> logfail["Log webhook_delivery_failed (swallowed)"]
+      teamsAnswer -- "non-429 4xx or retries exhausted" --> logfail["Record failure: log + Prometheus counter + dead-letter ring (/admin/dead-letters)"]
     end
 
     accepted -. "picked up later, paced" .-> slot
@@ -53,7 +53,7 @@ flowchart TD
     q503 --> sawError
 ```
 
-Note the consequence of fire-and-forget: a delivery that fails *after* the 202 (4xx, or retries exhausted) is **logged server-side, not returned to the caller**. The caller only learns of failures that happen *before* the 202 (validation 422, unknown target 400, queue full 503).
+Note the consequence of fire-and-forget: a delivery that fails *after* the 202 (non-429 4xx, or retries exhausted) is **not returned to the caller**, but it is no longer merely logged — it is **recorded**: a log line plus Prometheus counters on `/metrics` plus an entry in the dead-letter ring at `GET /api/v1/admin/dead-letters`. A `429` is **retried** (honoring `Retry-After`), not dropped. The caller only learns of failures that happen *before* the 202 (validation 422, unknown target 400, queue full 503 — and, when enabled, `401` send-auth / `429` send rate-limit).
 
 Two supporting cycles worth mentioning that don't fit in the flow above:
 
@@ -92,7 +92,7 @@ flowchart TD
     subgraph SVC ["🛠️ Service layer — the worker who does the job"]
       direction TB
       svc["<b>services/teams.py</b><br/><i>the craftsman: paints the Adaptive Card<br/>(or renders {text}), delivers it to Teams,<br/>retries if Teams is slow</i>"]
-      disp["<b>services/dispatcher.py</b><br/><i>the dispatcher: one paced queue + worker<br/>per webhook URL. Endpoints enqueue here<br/>and return 202; it drains each webhook<br/>~0.5s apart, fire-and-forget</i>"]
+      disp["<b>services/dispatcher.py</b><br/><i>the dispatcher: one paced queue + worker<br/>per webhook URL. Endpoints enqueue here<br/>and return 202; it AWAITS each send<br/>(strict serialization, prod ~4s apart),<br/>records terminal failures to metrics +<br/>a dead-letter ring, and can optionally<br/>mirror to a durable SQLite outbox</i>"]
       disp --> svc
     end
 
@@ -166,8 +166,12 @@ flowchart TD
 | `src/api/v1/endpoints/admin.py` | Manager-only. Reload config from disk, show the current settings (with secrets hidden). Needs the admin key. |
 | `src/api/v1/endpoints/meta.py` | Like the little plate next to your doorbell: name of the service, version. |
 | `src/api/deps.py` | The shared toolbox every endpoint reaches into — settings, the Teams worker, the admin-key check, request id. |
-| `src/services/teams.py` | Renders the Adaptive Card from your description, resolves the webhook (`resolve_webhook_url`), and performs the actual POST with retry/backoff (`post_rendered`, called by the dispatcher's worker). Retries on flaky networks / 5xx, never on 4xx. |
-| `src/services/dispatcher.py` | The per-webhook outbound **queue**. One `asyncio.Queue` + one background worker per webhook URL; the worker fires sends on a fixed cadence (≥ `per_webhook_min_interval_seconds`) so a burst to one webhook isn't throttled downstream. Created at startup (lifespan), drained in the background, fire-and-forget. Raises `WebhookQueueFull` when a queue is at capacity. |
+| `src/services/teams.py` | Renders the Adaptive Card from your description, resolves the webhook (`resolve_webhook_url`), and performs the actual POST with retry/backoff (`post_rendered`, called by the dispatcher's worker). Retries on flaky networks / 5xx, never on other 4xx (429 IS retried, honoring `Retry-After`). |
+| `src/services/dispatcher.py` | The per-webhook outbound **queue**. One `asyncio.Queue` + one background worker per webhook URL; the worker **awaits** each send on a fixed cadence (≥ `per_webhook_min_interval_seconds`; prod ~4s apart) — strict per-webhook serialization, so a burst isn't throttled downstream. Records terminal failures to Prometheus + a dead-letter ring, and can **optionally** mirror the queue to a durable SQLite outbox (off by default). Created at startup (lifespan), drained in the background, fire-and-forget. Raises `WebhookQueueFull` when a queue is at capacity. |
+| `src/services/dead_letter.py` | An in-memory ring of recent terminal delivery failures (what failed + why), read at `/admin/dead-letters`. |
+| `src/services/queue_store.py` | The optional durable SQLite WAL outbox: persists items on enqueue, deletes a row only after a successful delivery, and replays undelivered items at startup. Off by default. |
+| `src/services/ratelimit.py` | The per-caller token-bucket limiter for the send endpoints. Off by default. |
+| `src/core/metrics.py` | The Prometheus delivery counters (`webhook_deliveries_total`, `webhook_dropped_total`) exposed on `/metrics`. |
 | `src/core/config.py` | Reads `.env` and `config/app.yaml`. Remembers the values. Can reload from disk on demand without a restart. Masks secrets when you ask for a settings snapshot. |
 | `src/core/logging.py` | Decides how log lines look. JSON in production (for log shippers), readable for local development. |
 | `src/core/middleware.py` | Stamps every request with a unique ticket number, then writes one line in the journal per request with how long it took and how it ended. |
@@ -182,7 +186,7 @@ flowchart TD
 | `Dockerfile` | Recipe for building the container image. |
 | `docker-compose.yml` | How to run the container on the server (port mapping, volume mounts, restart policy, healthcheck). |
 | `.github/workflows/ci.yml` | The automatic pipeline: on every push to `main`, run tests, and if *code* changed, build the image, push it to the registry, and deploy to EC2. |
-| `tests/` | 58 tests — card rendering, both send endpoints (card + text), the 202 enqueue contract, per-webhook queue **pacing + independence + queue-full**, retry/exception mapping (service level), admin-key rules, config reload. |
+| `tests/` | 99 tests — card rendering, both send endpoints (card + text), the 202 enqueue contract, per-webhook queue **pacing + independence + queue-full**, retry/exception mapping (service level) including **429/`Retry-After` retry mechanics**, **delivery-failure visibility (metrics + dead-letter)**, **send-endpoint auth + rate limit**, **durable-outbox persist/replay**, admin-key rules, config reload. |
 | `artifacts/` | Historical reference only. Contains the original one-file script this whole project grew out of, plus a ready-made smoke-test payload. |
 
 ---
@@ -191,11 +195,14 @@ flowchart TD
 
 - **High-level message DSL** — describe banners, rows (left / right / both), buttons, inline markdown links; the service builds the Adaptive Card JSON for you.
 - **Plain-text path** — `POST /api/v1/teams/text` sends `{"text": "..."}` as a plain Teams message (for a Power Automate "Post message" flow). Same webhook selection + same queue as cards.
-- **Per-webhook outbound queue (fire-and-forget)** — both endpoints **enqueue and return `202 queued` instantly**; a background worker per webhook URL paces sends (≥ `per_webhook_min_interval_seconds`, default 0.5s) so a burst to one webhook isn't throttled/dropped by Power Automate / Teams. Different webhooks run in parallel; a full queue returns `503 WEBHOOK_QUEUE_FULL`.
+- **Per-webhook outbound queue (fire-and-forget)** — both endpoints **enqueue and return `202 queued` instantly**; a background worker per webhook URL paces sends (≥ `per_webhook_min_interval_seconds`, field default 10s / prod 4s) and **awaits** each POST (strict per-webhook serialization) so a burst to one webhook isn't throttled/dropped by Power Automate / Teams. Different webhooks run in parallel; a full queue returns `503 WEBHOOK_QUEUE_FULL`.
 - **API versioning** — everything lives under `/api/v1/...`.
 - **Config from `.env` + YAML** — both files are mountable as Docker volumes and reloadable without a restart.
 - **Typed exception hierarchy** — every failure gets a stable `code` and a uniform `ErrorResponse` envelope.
-- **Retry with exponential backoff** on timeouts, network errors, and downstream 5xx (never on 4xx).
+- **Retry with exponential backoff** on timeouts, network errors, and downstream 5xx and 429 (honoring `Retry-After`); never on other 4xx.
+- **Optional inbound auth + rate limit on the send endpoints** — an `X-Api-Key` check plus a per-caller token-bucket rate limit guard `/teams/messages` and `/teams/text`. Both off by default.
+- **Delivery-failure visibility** — terminal post-202 failures are surfaced via Prometheus counters on `/metrics` plus a dead-letter ring (`GET /admin/dead-letters`), not just a log line.
+- **Optional durable SQLite outbox** — persists queued items so they survive a restart/crash and replay at startup (at-least-once). Off by default.
 - **Structured JSON logging** with `X-Request-ID` correlation on every request and log line.
 - **OpenAPI / Swagger UI** out of the box with descriptions on every field.
 - **Health / readiness probes** for orchestrators.
@@ -276,7 +283,7 @@ Required repo secrets (set once via `gh secret set`):
 │   └── services/
 │       ├── teams.py           # render_card + resolve_webhook_url + post_rendered (retry/exception mapping)
 │       └── dispatcher.py      # per-webhook queue + paced background workers (fire-and-forget)
-├── tests/                     # 58 tests
+├── tests/                     # 99 tests
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .github/workflows/ci.yml
@@ -299,8 +306,11 @@ All endpoints are under `/api/v1`.
 |  POST  | `/teams/text`          | Enqueue a **plain-text** message (`{"text": ...}`) → `202 queued` |
 |  POST  | `/admin/reload-config` | Reload `.env` + YAML from disk (needs `X-Admin-Key`) |
 |   GET  | `/admin/config`        | Current settings, secrets masked (needs `X-Admin-Key`) |
+|   GET  | `/admin/dead-letters`  | Recent terminal delivery failures (post-202 drops), newest-first + per-reason summary (needs `X-Admin-Key`) |
 
-> **Both send endpoints are fire-and-forget:** they return `202 {"status":"queued"}` once the message is accepted into the per-webhook queue. The POST to Teams happens later in the background, paced. Failures *after* the 202 are logged server-side, not returned.
+> **Both send endpoints are fire-and-forget:** they return `202 {"status":"queued"}` once the message is accepted into the per-webhook queue. The POST to Teams happens later in the background, paced. Failures *after* the 202 are recorded (log + `/metrics` counters + `/admin/dead-letters`), not returned.
+>
+> **The send endpoints can require an `X-Api-Key`** and return `401 SEND_KEY_INVALID` / `429 RATE_LIMITED` when send-auth / rate-limit are enabled. Both are **off by default**.
 
 ### POST `/api/v1/teams/messages`
 
@@ -357,9 +367,9 @@ Why 64 KB: empirically the plain-message hard ceiling on the Power Automate "Pos
 
 ### Per-webhook outbound queue & pacing
 
-Both endpoints enqueue onto a **per-webhook queue** (`src/services/dispatcher.py`) and return `202` immediately. A background worker per webhook URL drains its queue on a **slot clock** — one send every `per_webhook_min_interval_seconds` — and **spawns** each POST so the cadence holds even when a POST is slow. Different webhooks are fully independent (own queue, worker, clock → parallel).
+Both endpoints enqueue onto a **per-webhook queue** (`src/services/dispatcher.py`) and return `202` immediately. A background worker per webhook URL drains its queue on a **slot clock** — one send every `per_webhook_min_interval_seconds` — and **awaits** each POST (strict per-webhook serialization, so this webhook never has two deliveries in flight at once). The slot clock paces the **start** of each delivery; a POST slower than the interval simply pushes the next start to its completion (effective spacing = `max(interval, post-duration)`). Different webhooks are fully independent (own queue, worker, clock → parallel).
 
-**Chosen interval: 10 seconds per webhook.** Backpressure: on shutdown the dispatcher cancels workers and logs any undrained items; if a queue hits `per_webhook_queue_maxsize` the enqueue returns `503 WEBHOOK_QUEUE_FULL`.
+**Chosen interval: 10 seconds per webhook** — that is the field *default*; **production explicitly runs 4 seconds** (per [Planned hardening](#planned-hardening-2026-06-11) item 6, set in the gitignored host `config/app.yaml`). Backpressure: on shutdown the dispatcher cancels workers and logs any undrained items; if a queue hits `per_webhook_queue_maxsize` the enqueue returns `503 WEBHOOK_QUEUE_FULL`.
 
 #### Send timestamps are the caller's responsibility
 
@@ -488,6 +498,8 @@ Every non-2xx response uses the same envelope:
 | `WEBHOOK_QUEUE_FULL`    |  503 | This webhook's outbound queue is at capacity     |
 | `ADMIN_KEY_MISSING`     |  503 | Server has no ADMIN_API_KEY set                 |
 | `ADMIN_KEY_INVALID`     |  401 | Wrong or missing X-Admin-Key                    |
+| `SEND_KEY_INVALID`      |  401 | Missing/invalid `X-Api-Key` on a send endpoint, when send auth is enforced (off by default) |
+| `RATE_LIMITED`          |  429 | Per-caller send rate limit exceeded, when enabled (off by default) |
 | `CONFIG_INVALID`        |  500 | Malformed YAML at reload time                   |
 | `INTERNAL_ERROR`        |  500 | Anything unexpected (full trace logged, generic message returned) |
 
@@ -506,9 +518,19 @@ Every non-2xx response uses the same envelope:
 | `LOG_LEVEL`                   | `INFO`              | `DEBUG` / `INFO` / `WARNING` / `ERROR`          |
 | `LOG_FORMAT`                  | `json`              | `json` (prod) or `pretty` (dev)                 |
 | `HTTPX_TIMEOUT_SECONDS`       | `15`                | Per-request outbound timeout                    |
-| `WEBHOOK_MAX_RETRIES`         | `2`                 | Retries for timeouts / network / 5xx only       |
+| `WEBHOOK_MAX_RETRIES`         | `2`                 | Retries for timeouts / network / 5xx / 429      |
+| `WEBHOOK_MAX_RETRY_AFTER_SECONDS` | `10.0`          | Caps the honored `Retry-After` on a 429 so a hostile/huge value can't park the queue |
 | `PER_WEBHOOK_MIN_INTERVAL_SECONDS` | `10`          | Min spacing between consecutive POSTs to the **same** webhook (per-webhook queue pacing) — the chosen plain-message cadence. See [pacing](#per-webhook-outbound-queue--pacing). |
 | `PER_WEBHOOK_QUEUE_MAXSIZE`   | `1000`              | Max pending items per per-webhook queue; over this, enqueue → `503` |
+| `DEAD_LETTER_CAPACITY`        | `200`               | Max recent terminal delivery failures kept for `GET /admin/dead-letters` |
+| `SEND_API_KEY`                | —                   | Secret required on `X-Api-Key` for the send endpoints when send auth is enforced (.env-only) |
+| `SEND_AUTH_ENFORCED`          | `false`             | When true, the send endpoints require a valid `X-Api-Key` (else 401). Off by default |
+| `SEND_RATE_LIMIT_ENABLED`     | `false`             | When true, applies a per-caller token-bucket rate limit to the send endpoints. Off by default |
+| `SEND_RATE_CAPACITY`          | `120`               | Token-bucket burst size per caller (only when rate limiting is on) |
+| `SEND_RATE_REFILL_PER_SEC`    | `20.0`              | Token-bucket steady refill per caller, tokens/sec (only when rate limiting is on) |
+| `QUEUE_PERSISTENCE_ENABLED`   | `false`             | When true, mirror the per-webhook queue to a durable SQLite outbox (survives restart). Off by default |
+| `QUEUE_DB_PATH`               | `data/outbox.sqlite3` | SQLite outbox path (restart-only; not hot-reloadable) |
+| `QUEUE_MAX_ATTEMPTS`          | `10`                | Max replays of a persisted item across restarts before it's dropped as poison |
 | `CORS_ALLOW_ORIGINS`          | `["*"]`             | JSON list (via pydantic-settings)               |
 | `ENV_FILE`                    | `./.env`            | Override path (for Docker volume mounts)        |
 | `CONFIG_FILE`                 | `./config/app.yaml` | Override YAML path                              |
@@ -523,12 +545,26 @@ teams:
 http:
   timeout_seconds: 15
   max_retries: 2
-  per_webhook_min_interval_seconds: 10    # pace sends to the same webhook (10s per webhook)
+  max_retry_after_seconds: 10             # cap on a honored 429 Retry-After
+  per_webhook_min_interval_seconds: 10    # pace sends to the same webhook (field default 10s; prod runs 4)
   per_webhook_queue_maxsize: 1000         # backpressure -> 503 when full
+  dead_letter_capacity: 200               # recent terminal failures kept for /admin/dead-letters
+  queue:                                  # durable SQLite outbox (off by default)
+    persistence_enabled: false
+    db_path: data/outbox.sqlite3          # restart-only
+    max_attempts: 10
 api:
   cors:
     allow_origins: ["*"]
+  auth:
+    send_enforced: false                  # require X-Api-Key on the send endpoints (off by default)
+  rate_limit:                             # per-caller send rate limit (off by default)
+    enabled: false
+    capacity: 120
+    refill_per_sec: 20
 ```
+
+> The send-endpoint secret itself (`SEND_API_KEY`) stays in `.env` only — never in this YAML.
 
 ### Reload without restart
 
