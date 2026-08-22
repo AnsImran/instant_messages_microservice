@@ -9,9 +9,48 @@
 
 teams:
   # Named webhook registry — clients send webhook_target: "superstat" to route.
+  #
+  # OUTBOUND MESSAGING IS DELIBERATELY OFF ACROSS THE WHOLE SYSTEM and this map is
+  # where the exam-distribution side of it is held off. Every name below is a real
+  # target that a running service already asks for by name; each is commented out,
+  # so an unknown-target 400 comes back and the caller records the message instead
+  # of sending it. That is the intended state, not a gap — the same arrangement as
+  # `teams_webhook_url` in the engine's notification_targets.yaml and `send_enforced`
+  # further down this file: the code stays, the address is withheld.
+  #
+  # NOTHING IS LOST WHILE THEY ARE OFF. A held-back alarm is still written to its
+  # service's console in full, and anything serious enough to stop the roster being
+  # served freezes the engine's cycle, which puts a notice at the top of the report
+  # that is emailed every five minutes.
+  #
+  # TO RELEASE: uncomment the ones you want and paste the Teams webhook URL, in
+  # config/app.yaml on the host (this file is the shape only). No code changes, no
+  # rebuild, no redeploy — POST /api/v1/admin/reload-config picks it up.
   named_webhooks:
     # superstat: "https://..."
     # marketing: "https://..."
+    #
+    # --- radiologists_service, the roster feed -------------------------------------
+    # Grouped by AUDIENCE rather than by severity: the target answers "whose problem
+    # is this?", which is what decides whether anybody acts. Severity is in the text.
+    #
+    # exam_distribution — the exam-distribution chat. Roles could not be read from
+    #   NewVue and a cached copy is in use; or no roles at all; or an account holds
+    #   the Radiologist role but is not Active, so it is being given no exams.
+    #   Addressed to whoever is RELYING on the roles, not to whoever repairs them.
+    # exam_distribution: "https://..."
+    #
+    # roster_data — Renew support. The data itself is wrong or suspect: a mapping
+    #   came back empty, an unseen vocabulary value appeared, the canary failed.
+    #   These are edits somebody made in NewVue and can unmake.
+    # roster_data: "https://..."
+    #
+    # roster_feed — engineering. An upstream stopped answering or changed shape.
+    # roster_feed: "https://..."
+    #
+    # roster_config — whoever runs the service. Our own configuration is wrong: an
+    #   override row binding to nobody, a cadence file that will not load.
+    # roster_config: "https://..."
 
   # Default styling applied when the caller omits values (currently advisory;
   # reserved for future expansion).
